@@ -3,7 +3,7 @@ import json
 import unittest
 
 from channel_common import Issue, format_response_comment
-from controller_cli import enqueue
+from controller_cli import enqueue, replay_issue, requeue_issue
 from server_worker import (
     FAILURE_PREFIX,
     LABEL_DEAD,
@@ -15,6 +15,7 @@ from server_worker import (
     finalize_issue,
     lease_label,
     process_one_issue,
+    run_once,
 )
 
 
@@ -83,9 +84,14 @@ class FakeClient:
             result = [issue for issue in result if all(label in issue.labels for label in labels)]
         return result
 
+    def list_open_cmd_issues(self, per_page=50):
+        return self.list_issues(state="open", per_page=per_page, labels=["channel:cmd", "channel:pending"])
+
     def create_issue(self, title, body, labels):
-        self.created_issues.append({"title": title, "body": body, "labels": labels})
-        return {"number": 100 + len(self.created_issues), "title": title, "body": body, "labels": labels}
+        number = 100 + len(self.created_issues)
+        self.created_issues.append({"title": title, "body": body, "labels": labels, "number": number})
+        self.issues[number] = Issue(number=number, title=title, body=body, labels=labels, state="open")
+        return {"number": number, "title": title, "body": body, "labels": labels}
 
 
 class WorkerTests(unittest.TestCase):
@@ -170,6 +176,16 @@ class WorkerTests(unittest.TestCase):
         self.assertIn(f"{FAILURE_PREFIX}3", issue.labels)
         self.assertNotIn(LABEL_PENDING, issue.labels)
 
+    def test_run_once_returns_structured_stats(self):
+        issue = self.make_issue()
+        client = FakeClient(issue)
+        result = run_once(client, "worker-a")
+        self.assertEqual(result["stats"]["seen"], 1)
+        self.assertEqual(result["stats"]["processed"], 1)
+        self.assertEqual(result["stats"]["errors"], 0)
+        self.assertEqual(result["results"][0]["issue"], 1)
+        self.assertEqual(result["worker_id"], "worker-a")
+
 
 class ControllerTests(unittest.TestCase):
     def make_issue(self, issue_number, request_id, command="ping", args=None, state="open"):
@@ -199,6 +215,41 @@ class ControllerTests(unittest.TestCase):
         client = FakeClient(issues=[self.make_issue(7, "req-fixed", args={"a": 1})])
         with self.assertRaises(ValueError):
             enqueue(client, "ping", {"a": 2}, "req-fixed")
+
+    def test_requeue_issue_reopens_dead_issue(self):
+        client = FakeClient(
+            issues=[
+                self.make_issue(
+                    7,
+                    "req-fixed",
+                    state="closed",
+                )
+            ]
+        )
+        client.issues[7].labels = ["channel:cmd", "channel:dead", "channel:done", "channel:failures:3"]
+        result = requeue_issue(client, 7)
+        self.assertEqual(result["action"], "requeue")
+        self.assertEqual(client.issues[7].state, "open")
+        self.assertIn(LABEL_PENDING, client.issues[7].labels)
+        self.assertNotIn(LABEL_DEAD, client.issues[7].labels)
+
+    def test_replay_issue_creates_new_issue_with_new_request_id(self):
+        client = FakeClient(issues=[self.make_issue(7, "req-fixed", command="echo", args={"a": 1}, state="closed")])
+        result = replay_issue(client, 7, "req-new")
+        self.assertEqual(result["action"], "replay")
+        self.assertEqual(result["source_issue_number"], 7)
+        self.assertNotEqual(result["issue_number"], 7)
+        created = client.issues[result["issue_number"]]
+        body = json.loads(created.body)
+        self.assertEqual(body["request_id"], "req-new")
+        self.assertEqual(body["command"], "echo")
+
+    def test_replay_issue_same_request_id_falls_back_to_requeue(self):
+        client = FakeClient(issues=[self.make_issue(7, "req-fixed", state="closed")])
+        client.issues[7].labels = ["channel:cmd", "channel:dead", "channel:failures:3"]
+        result = replay_issue(client, 7, "req-fixed")
+        self.assertEqual(result["action"], "requeue")
+        self.assertEqual(client.issues[7].state, "open")
 
 
 if __name__ == "__main__":

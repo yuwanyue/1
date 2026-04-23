@@ -243,29 +243,61 @@ def process_one_issue(client: GitHubQueueClient, issue, worker_id: str) -> Dict[
             f"issue #{claimed.number} response persisted but finalization is incomplete: {finalize_error}"
         ) from finalize_error
 
-    return {"issue": claimed.number, "status": "processed", "request_id": resp["request_id"]}
+    return {
+        "issue": claimed.number,
+        "status": "processed",
+        "request_id": resp["request_id"],
+        "replayed_response": response_written and existing is not None,
+    }
 
 
 def run_once(client: GitHubQueueClient, worker_id: str):
     issues = client.list_open_cmd_issues(per_page=30)
-    processed = 0
-    skipped = 0
+    stats = {
+        "seen": len(issues),
+        "processed": 0,
+        "skipped": 0,
+        "replayed": 0,
+        "retried": 0,
+        "dead_lettered": 0,
+        "errors": 0,
+    }
+    results = []
     for issue in issues:
-        result = process_one_issue(client, issue, worker_id)
-        if result["status"] == "processed":
-            processed += 1
-        else:
-            skipped += 1
-    return {"seen": len(issues), "processed": processed, "skipped": skipped}
+        before_labels = list(issue.labels)
+        try:
+            result = process_one_issue(client, issue, worker_id)
+            if result["status"] == "processed":
+                stats["processed"] += 1
+                if result.get("replayed_response"):
+                    stats["replayed"] += 1
+            else:
+                stats["skipped"] += 1
+            results.append(result)
+        except Exception as exc:
+            stats["errors"] += 1
+            current = client.get_issue(issue.number)
+            current_failures = failure_count_from_labels(current.labels)
+            if LABEL_DEAD in current.labels:
+                stats["dead_lettered"] += 1
+            elif current_failures > failure_count_from_labels(before_labels):
+                stats["retried"] += 1
+            results.append(
+                {
+                    "issue": issue.number,
+                    "status": "error",
+                    "error": str(exc),
+                    "failure_count": current_failures,
+                    "dead_lettered": LABEL_DEAD in current.labels,
+                }
+            )
+    return {"worker_id": worker_id, "ts": utc_now_iso(), "stats": stats, "results": results}
 
 
 def run_loop(client: GitHubQueueClient, interval: int, worker_id: str):
     while True:
         result = run_once(client, worker_id)
-        print(
-            f"[{utc_now_iso()}] "
-            f"seen={result['seen']} processed={result['processed']} skipped={result['skipped']}"
-        )
+        print(json.dumps(result, ensure_ascii=False))
         time.sleep(interval)
 
 

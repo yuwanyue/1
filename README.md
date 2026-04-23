@@ -112,6 +112,26 @@ python3 controller_cli.py call ping --args '{}'
 python3 server_worker.py loop --interval 3
 ```
 
+### 死信回放
+
+重新把原 issue 放回队列：
+
+```bash
+python3 controller_cli.py requeue --issue 123
+```
+
+按原命令内容新建一次回放：
+
+```bash
+python3 controller_cli.py replay --issue 123
+```
+
+也可指定新的 request_id：
+
+```bash
+python3 controller_cli.py replay --issue 123 --request-id req_manual_replay_1
+```
+
 ---
 
 ## 内置命令处理器
@@ -140,6 +160,9 @@ python3 -m unittest discover -s tests -v
 - 如果评论已经存在，worker 会直接复用已有响应并收尾，避免重复执行
 - 回滚时会累计 `channel:failures:N`，超过 `CHANNEL_MAX_FAILURES` 后进入 `channel:dead`
 - 控制端重复提交同一个 `request_id` 时会复用已有命令 issue，不会重复创建任务
+- `controller_cli.py requeue` 可把死信或失败任务重新放回队列
+- `controller_cli.py replay` 可复制原命令为一条新任务，方便人工回放
+- worker 每轮输出一条 JSON，包含 `seen/processed/replayed/retried/dead_lettered/errors`
 
 ---
 

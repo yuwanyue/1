@@ -7,13 +7,20 @@ import time
 
 from channel_common import (
     GitHubQueueClient,
-    Issue,
     extract_response_comments,
     generate_request_id,
     parse_cmd_issue_body,
     sanitize_title,
     safe_json_arg,
 )
+
+LABEL_PENDING = "channel:pending"
+LABEL_PROCESSING = "channel:processing"
+LABEL_DONE = "channel:done"
+LABEL_RETRY = "channel:retry"
+LABEL_DEAD = "channel:dead"
+LEASE_PREFIX = "channel:lease:"
+FAILURE_PREFIX = "channel:failures:"
 
 
 def make_client() -> GitHubQueueClient:
@@ -55,6 +62,62 @@ def find_issue_by_request_id(client: GitHubQueueClient, request_id: str):
     return None
 
 
+def normalize_labels(labels):
+    return sorted({label for label in labels if label})
+
+
+def reset_issue_for_queue(issue, keep_done: bool = False):
+    labels = []
+    for label in issue.labels:
+        if label.startswith(LEASE_PREFIX):
+            continue
+        if label.startswith(FAILURE_PREFIX):
+            continue
+        if label in {LABEL_PROCESSING, LABEL_RETRY, LABEL_DEAD}:
+            continue
+        if label == LABEL_DONE and not keep_done:
+            continue
+        labels.append(label)
+    if LABEL_PENDING not in labels:
+        labels.append(LABEL_PENDING)
+    return normalize_labels(labels)
+
+
+def requeue_issue(client: GitHubQueueClient, issue_number: int):
+    issue = client.get_issue(issue_number)
+    payload = parse_cmd_issue_body(issue.body)
+    labels = reset_issue_for_queue(issue)
+    client.update_issue(issue.number, {"state": "open", "labels": labels})
+    return {
+        "action": "requeue",
+        "issue_number": issue.number,
+        "request_id": payload["request_id"],
+        "labels": labels,
+    }
+
+
+def replay_issue(client: GitHubQueueClient, issue_number: int, new_request_id: str = ""):
+    issue = client.get_issue(issue_number)
+    payload = parse_cmd_issue_body(issue.body)
+    rid = new_request_id or generate_request_id()
+    if rid == payload["request_id"]:
+        return requeue_issue(client, issue_number)
+    return_payload = {
+        "version": payload["version"],
+        "request_id": rid,
+        "command": payload["command"],
+        "args": payload["args"],
+    }
+    title = sanitize_title(f"[cmd] {payload['command']} ({rid})")
+    created = client.create_issue(title, json.dumps(return_payload, ensure_ascii=False), ["channel:cmd", "channel:pending"])
+    return {
+        "action": "replay",
+        "source_issue_number": issue.number,
+        "issue_number": created["number"],
+        "request_id": rid,
+    }
+
+
 def wait_response(client: GitHubQueueClient, issue_number: int, request_id: str, timeout: int = 120, interval: int = 2):
     start = time.time()
     while time.time() - start < timeout:
@@ -91,6 +154,18 @@ def cmd_call(args):
     print(json.dumps({"issue": issue_no, "response": resp}, ensure_ascii=False))
 
 
+def cmd_requeue(args):
+    client = make_client()
+    result = requeue_issue(client, args.issue)
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_replay(args):
+    client = make_client()
+    result = replay_issue(client, args.issue, args.request_id)
+    print(json.dumps(result, ensure_ascii=False))
+
+
 def main():
     p = argparse.ArgumentParser(description="External controller for async issue channel")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -115,6 +190,15 @@ def main():
     p_call.add_argument("--timeout", type=int, default=120)
     p_call.add_argument("--interval", type=int, default=2)
     p_call.set_defaults(func=cmd_call)
+
+    p_requeue = sub.add_parser("requeue")
+    p_requeue.add_argument("--issue", type=int, required=True)
+    p_requeue.set_defaults(func=cmd_requeue)
+
+    p_replay = sub.add_parser("replay")
+    p_replay.add_argument("--issue", type=int, required=True)
+    p_replay.add_argument("--request-id", default="")
+    p_replay.set_defaults(func=cmd_replay)
 
     args = p.parse_args()
     try:

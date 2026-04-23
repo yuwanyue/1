@@ -138,6 +138,8 @@ python3 -m unittest discover -s tests -v
 - 领取时会写入唯一 lease label，避免多个 worker 同时把同一条任务当成自己的
 - 如果响应评论写入失败，worker 会把任务回滚到 `channel:pending + channel:retry`
 - 如果评论已经存在，worker 会直接复用已有响应并收尾，避免重复执行
+- 回滚时会累计 `channel:failures:N`，超过 `CHANNEL_MAX_FAILURES` 后进入 `channel:dead`
+- 控制端重复提交同一个 `request_id` 时会复用已有命令 issue，不会重复创建任务
 
 ---
 
@@ -145,4 +147,5 @@ python3 -m unittest discover -s tests -v
 
 - Issue 队列天然是**至少一次投递**语义，处理器应继续保持幂等。
 - lease 基于 GitHub issue labels 做“最后写入者获胜”的乐观锁，已经比直接轮询安全很多，但仍不等于数据库事务锁。
-- 生产可继续加：签名、白名单命令、分片标签、死信标签、重试计数、响应完整性校验。
+- `CHANNEL_MAX_FAILURES` 默认值是 `3`。
+- 生产可继续加：签名、白名单命令、分片标签、死信人工回放、响应完整性校验。

@@ -7,8 +7,10 @@ import time
 
 from channel_common import (
     GitHubQueueClient,
+    Issue,
     extract_response_comments,
     generate_request_id,
+    parse_cmd_issue_body,
     sanitize_title,
     safe_json_arg,
 )
@@ -25,6 +27,14 @@ def make_client() -> GitHubQueueClient:
 
 def enqueue(client: GitHubQueueClient, command: str, args: dict, request_id: str = ""):
     rid = request_id or generate_request_id()
+    existing = find_issue_by_request_id(client, rid)
+    if existing is not None:
+        payload = parse_cmd_issue_body(existing.body)
+        if payload["command"] != command or payload["args"] != args:
+            raise ValueError(
+                f"request_id={rid} already exists on issue #{existing.number} with different payload"
+            )
+        return rid, existing.number
     title = sanitize_title(f"[cmd] {command} ({rid})")
     body = json.dumps(
         {"version": "v1", "request_id": rid, "command": command, "args": args},
@@ -32,6 +42,17 @@ def enqueue(client: GitHubQueueClient, command: str, args: dict, request_id: str
     )
     issue = client.create_issue(title, body, ["channel:cmd", "channel:pending"])
     return rid, issue["number"]
+
+
+def find_issue_by_request_id(client: GitHubQueueClient, request_id: str):
+    for issue in client.list_issues(state="all", labels=["channel:cmd"]):
+        try:
+            payload = parse_cmd_issue_body(issue.body)
+        except ValueError:
+            continue
+        if payload["request_id"] == request_id:
+            return issue
+    return None
 
 
 def wait_response(client: GitHubQueueClient, issue_number: int, request_id: str, timeout: int = 120, interval: int = 2):

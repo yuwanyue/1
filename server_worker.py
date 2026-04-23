@@ -20,7 +20,9 @@ LABEL_PENDING = "channel:pending"
 LABEL_PROCESSING = "channel:processing"
 LABEL_DONE = "channel:done"
 LABEL_RETRY = "channel:retry"
+LABEL_DEAD = "channel:dead"
 LEASE_PREFIX = "channel:lease:"
+FAILURE_PREFIX = "channel:failures:"
 
 
 class CommandHandlers:
@@ -78,6 +80,32 @@ def response_issue_title(request_id: str) -> str:
     return f"[evt] response {request_id}"
 
 
+def max_failures() -> int:
+    raw = os.getenv("CHANNEL_MAX_FAILURES", "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, value)
+
+
+def failure_count_from_labels(labels) -> int:
+    count = 0
+    for label in labels:
+        if label.startswith(FAILURE_PREFIX):
+            try:
+                count = max(count, int(label[len(FAILURE_PREFIX) :]))
+            except ValueError:
+                continue
+    return count
+
+
+def replace_failure_label(labels, count: int):
+    next_labels = [label for label in labels if not label.startswith(FAILURE_PREFIX)]
+    next_labels.append(f"{FAILURE_PREFIX}{count}")
+    return next_labels
+
+
 def claim_issue(client: GitHubQueueClient, issue, worker_id: str):
     if issue.state != "open" or LABEL_PENDING not in issue.labels:
         return None
@@ -110,12 +138,20 @@ def rollback_claim(client: GitHubQueueClient, issue_number: int, worker_id: str,
         for label in current.labels
         if label != LABEL_PROCESSING and label != mine
     ]
-    if LABEL_DONE not in labels and LABEL_PENDING not in labels:
-        labels.append(LABEL_PENDING)
-    if LABEL_RETRY not in labels:
-        labels.append(LABEL_RETRY)
-    client.update_issue(issue_number, {"state": "open", "labels": normalize_labels(labels)})
-    return reason
+    failures = failure_count_from_labels(labels) + 1
+    labels = replace_failure_label(labels, failures)
+    if failures >= max_failures():
+        labels = [label for label in labels if label != LABEL_PENDING and label != LABEL_RETRY]
+        labels.append(LABEL_DEAD)
+        state = "closed"
+    else:
+        if LABEL_DONE not in labels and LABEL_PENDING not in labels:
+            labels.append(LABEL_PENDING)
+        if LABEL_RETRY not in labels:
+            labels.append(LABEL_RETRY)
+        state = "open"
+    client.update_issue(issue_number, {"state": state, "labels": normalize_labels(labels)})
+    return {"reason": reason, "failure_count": failures, "dead_lettered": failures >= max_failures()}
 
 
 def ensure_response_event_issue(client: GitHubQueueClient, resp: Dict[str, Any]) -> None:
@@ -133,7 +169,7 @@ def finalize_issue(client: GitHubQueueClient, issue_number: int, worker_id: str)
     labels = [
         label
         for label in current.labels
-        if label not in {LABEL_PENDING, LABEL_PROCESSING, LABEL_RETRY, mine}
+        if label not in {LABEL_PENDING, LABEL_PROCESSING, LABEL_RETRY, LABEL_DEAD, mine}
         and not label.startswith(LEASE_PREFIX)
     ]
     labels.append(LABEL_DONE)
@@ -177,14 +213,15 @@ def process_one_issue(client: GitHubQueueClient, issue, worker_id: str) -> Dict[
                 client.add_comment(claimed.number, format_response_comment(resp))
             response_written = True
         except Exception as comment_error:
-            rollback_claim(
+            rollback = rollback_claim(
                 client,
                 claimed.number,
                 worker_id,
                 f"response comment failed after retries: {comment_error}",
             )
+            outcome = "moved to dead-letter queue" if rollback["dead_lettered"] else "returned to pending queue"
             raise RuntimeError(
-                f"issue #{claimed.number} failed and was returned to pending queue: {comment_error}"
+                f"issue #{claimed.number} {outcome} after failure #{rollback['failure_count']}: {comment_error}"
             ) from comment_error
 
     try:
@@ -192,12 +229,16 @@ def process_one_issue(client: GitHubQueueClient, issue, worker_id: str) -> Dict[
         finalize_issue(client, claimed.number, worker_id)
     except Exception as finalize_error:
         if not response_written:
-            rollback_claim(
+            rollback = rollback_claim(
                 client,
                 claimed.number,
                 worker_id,
                 f"finalize failed before response persisted: {finalize_error}",
             )
+            outcome = "moved to dead-letter queue" if rollback["dead_lettered"] else "returned to pending queue"
+            raise RuntimeError(
+                f"issue #{claimed.number} {outcome} after failure #{rollback['failure_count']}: {finalize_error}"
+            ) from finalize_error
         raise RuntimeError(
             f"issue #{claimed.number} response persisted but finalization is incomplete: {finalize_error}"
         ) from finalize_error

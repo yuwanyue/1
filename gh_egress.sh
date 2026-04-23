@@ -15,6 +15,7 @@ fi
 URL="$1"
 METHOD="${2:-GET}"
 BODY_TEXT="${3:-}"
+REQUEST_ID="req-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 api() {
 local method="$1"; shift
@@ -40,30 +41,38 @@ else
 BODY_B64=""
 fi
 
-payload="$(python3 - <<'PY' "$BRANCH" "$URL" "$METHOD" "$BODY_B64"
+payload="$(python3 - <<'PY' "$BRANCH" "$URL" "$METHOD" "$BODY_B64" "$REQUEST_ID"
 import json,sys
 print(json.dumps({
 "ref": sys.argv[1],
 "inputs": {
 "url": sys.argv[2],
 "method": sys.argv[3],
-"body_b64": sys.argv[4]
+"body_b64": sys.argv[4],
+"request_id": sys.argv[5]
 }
 }))
 PY
 )"
 
 api POST "https://api.github.com/repos/$OWNER/$REPO/actions/workflows/$WF/dispatches" -d "$payload" >/dev/null
-echo "[+] dispatched"
+echo "[+] dispatched request_id=$REQUEST_ID"
 
 # 3) get latest run id
 RUN_ID=""
-for _ in $(seq 1 20); do
-runs_json="$(api GET "https://api.github.com/repos/$OWNER/$REPO/actions/workflows/$WF/runs?event=workflow_dispatch&per_page=1")"
-RUN_ID="$(python3 - <<'PY' "$runs_json"
+for _ in $(seq 1 30); do
+runs_json="$(api GET "https://api.github.com/repos/$OWNER/$REPO/actions/workflows/$WF/runs?event=workflow_dispatch&per_page=20")"
+RUN_ID="$(python3 - <<'PY' "$runs_json" "$REQUEST_ID"
 import json,sys
-runs=json.loads(sys.argv[1]).get("workflow_runs",[])
-print(runs[0]["id"] if runs else "")
+request_id = sys.argv[2]
+runs = json.loads(sys.argv[1]).get("workflow_runs", [])
+match = ""
+for run in runs:
+    title = run.get("display_title", "") or ""
+    if request_id in title:
+        match = str(run["id"])
+        break
+print(match)
 PY
 )"
 [[ -n "$RUN_ID" ]] && break
@@ -85,8 +94,7 @@ import json,sys
 d=json.loads(sys.argv[1]); print(d.get("conclusion",""))
 PY
 )"
-ech
-o " $status:$conclusion"
+echo " $status:$conclusion"
 [[ "$status" == "completed" ]] && break
 sleep 3
 done

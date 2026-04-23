@@ -1,0 +1,65 @@
+name: egress-fetch
+on:
+workflow_dispatch:
+inputs:
+url:
+description: target url
+required: true
+type: string
+method:
+description: GET/POST...
+required: false
+default: GET
+type: string
+body_b64:
+description: base64 request body (optional)
+required: false
+default: ""
+type: string
+
+jobs:
+fetch:
+runs-on: ubuntu-latest
+permissions:
+contents: write
+steps:
+- name: Fetch target
+env:
+URL: ${{ inputs.url }}
+METHOD: ${{ inputs.method }}
+BODY_B64: ${{ inputs.body_b64 }}
+run: |
+set -euo pipefail
+mkdir -p out
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+echo "{\"url\":\"$URL\",\"method\":\"$METHOD\",\"time\":\"$ts\",\"run_id\":\"${GITHUB_RUN_ID}\"}" > out/meta.json
+
+if [ -n "$BODY_B64" ]; then
+echo "$BODY_B64" | base64 -d > out/req_body.bin || true
+curl -sS -L -X "$METHOD" \
+--connect-timeout 15 --max-time 120 \
+--data-binary @out/req_body.bin \
+-D out/headers.txt -o out/body.bin "$URL" || true
+else
+curl -sS -L -X "$METHOD" \
+--connect-timeout 15 --max-time 120 \
+-D out/headers.txt -o out/body.bin "$URL" || true
+fi
+
+# 记录状态码
+code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt)
+echo "${code:-unknown}" > out/status_code.txt
+
+tar -czf result.tgz -C out .
+
+- name: Create release tag
+id: vars
+run: |
+echo "tag=run-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+- name: Publish release with asset
+uses: softprops/action-gh-release@v2
+with:
+tag_name: ${{ steps.vars.outputs.tag }}
+name: ${{ steps.vars.outputs.tag }}
+files: result.tgz

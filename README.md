@@ -112,6 +112,24 @@ python3 controller_cli.py call ping --args '{}'
 python3 server_worker.py loop --interval 3
 ```
 
+### 受限端“仅 GitHub 出站”访问外网（HTTP 中转）
+
+前提：仓库已存在工作流 `.github/workflows/egress-fetch.yml`（本仓库已内置）。
+
+控制端入队：
+
+```bash
+python3 controller_cli.py enqueue egress.fetch --args '{"url":"https://example.com","method":"GET"}'
+```
+
+worker 执行后，响应里会包含：
+- `status_code`
+- `headers_preview`
+- `body_preview`
+- `body_b64_head`（body 前 32KB 的 base64）
+
+这样受限服务器无需直连目标站点，只需访问 GitHub API 与 Actions。
+
 ### 死信回放
 
 重新把原 issue 放回队列：
@@ -139,6 +157,7 @@ python3 controller_cli.py replay --issue 123 --request-id req_manual_replay_1
 - `ping` -> 返回 pong
 - `echo` -> 回显参数
 - `system.info` -> 返回 hostname / utc_time
+- `egress.fetch` -> 通过 GitHub Actions 工作流代发起 HTTP 请求（受限端仅访问 GitHub）
 
 你可在 `server_worker.py` 中扩展 `CommandHandlers`。
 

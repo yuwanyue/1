@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import datetime as dt
 import json
 import os
 import socket
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict
 from uuid import uuid4
 
@@ -25,6 +28,148 @@ LEASE_PREFIX = "channel:lease:"
 FAILURE_PREFIX = "channel:failures:"
 
 
+def _api_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "async-channel-template/1.0",
+    }
+
+
+def _api_json(method: str, url: str, token: str, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    data = None
+    headers = _api_headers(token)
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, method=method, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body) if body else {}
+
+
+def _download_bytes(url: str, token: str) -> bytes:
+    req = urllib.request.Request(url, method="GET", headers=_api_headers(token))
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+
+def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
+    token = os.getenv("GITHUB_TOKEN", "")
+    owner = os.getenv("CHANNEL_OWNER", "")
+    repo = os.getenv("CHANNEL_REPO", "")
+    if not token or not owner or not repo:
+        raise RuntimeError("need GITHUB_TOKEN, CHANNEL_OWNER, CHANNEL_REPO")
+
+    url = str(args.get("url", "")).strip()
+    if not url:
+        raise ValueError("egress.fetch requires args.url")
+    method = str(args.get("method", "GET")).upper().strip() or "GET"
+    body_text = str(args.get("body", ""))
+    request_id = str(args.get("request_id", f"eg_{int(time.time())}_{uuid4().hex[:8]}"))
+    workflow = str(args.get("workflow", os.getenv("CHANNEL_EGRESS_WORKFLOW", "egress-fetch.yml")))
+
+    body_b64 = base64.b64encode(body_text.encode("utf-8")).decode("ascii") if body_text else ""
+    dispatch_payload = {
+        "ref": os.getenv("CHANNEL_EGRESS_REF", "main"),
+        "inputs": {
+            "url": url,
+            "method": method,
+            "body_b64": body_b64,
+            "request_id": request_id,
+        },
+    }
+
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+    dispatch_url = f"{base}/actions/workflows/{workflow}/dispatches"
+    _api_json("POST", dispatch_url, token, dispatch_payload)
+
+    max_wait = int(args.get("max_wait_seconds", os.getenv("CHANNEL_EGRESS_MAX_WAIT", "180")))
+    poll_interval = int(args.get("poll_interval_seconds", os.getenv("CHANNEL_EGRESS_POLL_INTERVAL", "3")))
+
+    run_id = ""
+    deadline = time.time() + max_wait
+    while time.time() < deadline and not run_id:
+        runs_url = f"{base}/actions/workflows/{workflow}/runs?event=workflow_dispatch&per_page=20"
+        runs = _api_json("GET", runs_url, token)
+        for run in runs.get("workflow_runs", []):
+            title = (run.get("display_title") or "")
+            if request_id in title:
+                run_id = str(run.get("id", ""))
+                break
+        if not run_id:
+            time.sleep(max(1, poll_interval))
+    if not run_id:
+        raise TimeoutError(f"egress workflow run not found for request_id={request_id}")
+
+    conclusion = ""
+    while time.time() < deadline:
+        run = _api_json("GET", f"{base}/actions/runs/{run_id}", token)
+        status = run.get("status", "")
+        conclusion = run.get("conclusion", "") or ""
+        if status == "completed":
+            break
+        time.sleep(max(1, poll_interval))
+    else:
+        raise TimeoutError(f"egress workflow run timeout run_id={run_id}")
+
+    if conclusion != "success":
+        raise RuntimeError(f"egress workflow failed run_id={run_id} conclusion={conclusion}")
+
+    release = _api_json("GET", f"{base}/releases/tags/run-{run_id}", token)
+    assets = release.get("assets", [])
+    if not assets:
+        raise RuntimeError(f"no release asset for run-{run_id}")
+    asset_url = assets[0].get("browser_download_url", "")
+    if not asset_url:
+        raise RuntimeError(f"invalid asset url for run-{run_id}")
+
+    import io
+    import tarfile
+
+    archive = _download_bytes(asset_url, token)
+    status_code = "unknown"
+    headers_preview = ""
+    body_preview = ""
+    body_b64_out = ""
+
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+        members = {m.name: m for m in tf.getmembers()}
+
+        def _member_by_suffix(name: str):
+            if name in members:
+                return members[name]
+            for k, v in members.items():
+                if k.endswith("/" + name) or k.endswith(name):
+                    return v
+            return None
+
+        m_status = _member_by_suffix("status_code.txt")
+        if m_status is not None:
+            status_code = tf.extractfile(m_status).read().decode("utf-8", "replace").strip()
+
+        m_headers = _member_by_suffix("headers.txt")
+        if m_headers is not None:
+            headers_preview = tf.extractfile(m_headers).read(2048).decode("utf-8", "replace")
+
+        m_body = _member_by_suffix("body.bin")
+        if m_body is not None:
+            body = tf.extractfile(m_body).read()
+            body_preview = body[:1000].decode("utf-8", "replace")
+            body_b64_out = base64.b64encode(body[:32768]).decode("ascii")
+
+    return {
+        "request_id": request_id,
+        "run_id": run_id,
+        "url": url,
+        "method": method,
+        "status_code": status_code,
+        "headers_preview": headers_preview,
+        "body_preview": body_preview,
+        "body_b64_head": body_b64_out,
+    }
+
+
 class CommandHandlers:
     @staticmethod
     def handle(command: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -37,6 +182,8 @@ class CommandHandlers:
                 "hostname": socket.gethostname(),
                 "utc_time": utc_now_iso(),
             }
+        if command == "egress.fetch":
+            return run_github_egress_fetch(args)
         raise ValueError(f"unknown command: {command}")
 
 

@@ -6,25 +6,34 @@ import os
 import socket
 import time
 from typing import Any, Dict
+from uuid import uuid4
 
 from channel_common import (
     GitHubQueueClient,
+    find_response_for_request_id,
     format_response_comment,
     parse_cmd_issue_body,
 )
+
+LABEL_CMD = "channel:cmd"
+LABEL_PENDING = "channel:pending"
+LABEL_PROCESSING = "channel:processing"
+LABEL_DONE = "channel:done"
+LABEL_RETRY = "channel:retry"
+LEASE_PREFIX = "channel:lease:"
 
 
 class CommandHandlers:
     @staticmethod
     def handle(command: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if command == "ping":
-            return {"pong": True, "utc": dt.datetime.utcnow().isoformat() + "Z"}
+            return {"pong": True, "utc": utc_now_iso()}
         if command == "echo":
             return {"echo": args}
         if command == "system.info":
             return {
                 "hostname": socket.gethostname(),
-                "utc_time": dt.datetime.utcnow().isoformat() + "Z",
+                "utc_time": utc_now_iso(),
             }
         raise ValueError(f"unknown command: {command}")
 
@@ -38,55 +47,184 @@ def make_client() -> GitHubQueueClient:
     return GitHubQueueClient(token, owner, repo)
 
 
-def process_one_issue(client: GitHubQueueClient, issue) -> None:
-    try:
-        cmd = parse_cmd_issue_body(issue.body)
-        result = CommandHandlers.handle(cmd["command"], cmd.get("args", {}))
-        resp = {
-            "version": "v1",
-            "request_id": cmd["request_id"],
-            "status": "ok",
-            "result": result,
-            "processed_at": dt.datetime.utcnow().isoformat() + "Z",
-        }
-    except Exception as e:
-        req_id = "unknown"
-        try:
-            req_id = json.loads(issue.body).get("request_id", "unknown")
-        except Exception:
-            pass
-        resp = {
-            "version": "v1",
-            "request_id": req_id,
-            "status": "error",
-            "error": str(e),
-            "processed_at": dt.datetime.utcnow().isoformat() + "Z",
-        }
+def make_worker_id() -> str:
+    return f"{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:8]}"
 
-    client.add_comment(issue.number, format_response_comment(resp))
-    labels = [l for l in issue.labels if l != "channel:pending"]
-    for l in ["channel:done"]:
-        if l not in labels:
-            labels.append(l)
-    client.update_issue(issue.number, {"state": "closed", "labels": labels})
 
-    # Optional reverse event issue
-    evt_title = f"[evt] response {resp['request_id']}"
+def lease_label(worker_id: str) -> str:
+    return f"{LEASE_PREFIX}{worker_id}"
+
+
+def normalize_labels(labels):
+    return sorted({label for label in labels if label})
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_response(request_id: str, status: str, **extra) -> Dict[str, Any]:
+    payload = {
+        "version": "v1",
+        "request_id": request_id,
+        "status": status,
+        "processed_at": utc_now_iso(),
+    }
+    payload.update(extra)
+    return payload
+
+
+def response_issue_title(request_id: str) -> str:
+    return f"[evt] response {request_id}"
+
+
+def claim_issue(client: GitHubQueueClient, issue, worker_id: str):
+    if issue.state != "open" or LABEL_PENDING not in issue.labels:
+        return None
+    mine = lease_label(worker_id)
+    labels = [
+        label
+        for label in issue.labels
+        if label != LABEL_PENDING and not label.startswith(LEASE_PREFIX)
+    ]
+    labels.extend([LABEL_PROCESSING, mine])
+    client.update_issue(issue.number, {"labels": normalize_labels(labels)})
+    refreshed = client.get_issue(issue.number)
+    current_leases = [label for label in refreshed.labels if label.startswith(LEASE_PREFIX)]
+    if refreshed.state != "open":
+        return None
+    if LABEL_PENDING in refreshed.labels:
+        return None
+    if LABEL_PROCESSING not in refreshed.labels:
+        return None
+    if current_leases != [mine]:
+        return None
+    return refreshed
+
+
+def rollback_claim(client: GitHubQueueClient, issue_number: int, worker_id: str, reason: str):
+    current = client.get_issue(issue_number)
+    mine = lease_label(worker_id)
+    labels = [
+        label
+        for label in current.labels
+        if label != LABEL_PROCESSING and label != mine
+    ]
+    if LABEL_DONE not in labels and LABEL_PENDING not in labels:
+        labels.append(LABEL_PENDING)
+    if LABEL_RETRY not in labels:
+        labels.append(LABEL_RETRY)
+    client.update_issue(issue_number, {"state": "open", "labels": normalize_labels(labels)})
+    return reason
+
+
+def ensure_response_event_issue(client: GitHubQueueClient, resp: Dict[str, Any]) -> None:
+    title = response_issue_title(resp["request_id"])
+    for issue in client.list_issues(state="all", labels=["channel:event", "channel:response"]):
+        if issue.title == title:
+            return
     evt_body = json.dumps(resp, ensure_ascii=False)
-    client.create_issue(evt_title, evt_body, ["channel:event", "channel:response"])
+    client.create_issue(title, evt_body, ["channel:event", "channel:response"])
 
 
-def run_once(client: GitHubQueueClient):
+def finalize_issue(client: GitHubQueueClient, issue_number: int, worker_id: str) -> None:
+    current = client.get_issue(issue_number)
+    mine = lease_label(worker_id)
+    labels = [
+        label
+        for label in current.labels
+        if label not in {LABEL_PENDING, LABEL_PROCESSING, LABEL_RETRY, mine}
+        and not label.startswith(LEASE_PREFIX)
+    ]
+    labels.append(LABEL_DONE)
+    client.update_issue(issue_number, {"state": "closed", "labels": normalize_labels(labels)})
+
+
+def process_one_issue(client: GitHubQueueClient, issue, worker_id: str) -> Dict[str, Any]:
+    claimed = claim_issue(client, issue, worker_id)
+    if claimed is None:
+        return {"issue": issue.number, "status": "skipped", "reason": "claim-lost"}
+
+    response_written = False
+    resp = None
+    try:
+        cmd = parse_cmd_issue_body(claimed.body)
+        existing = find_response_for_request_id(client.list_comments(claimed.number), cmd["request_id"])
+        if existing is not None:
+            resp = existing
+            response_written = True
+        else:
+            result = CommandHandlers.handle(cmd["command"], cmd.get("args", {}))
+            resp = build_response(cmd["request_id"], "ok", result=result)
+            client.add_comment(claimed.number, format_response_comment(resp))
+            response_written = True
+    except Exception as e:
+        try:
+            req_id = json.loads(claimed.body).get("request_id", "unknown")
+        except Exception:
+            req_id = "unknown"
+        resp = build_response(
+            req_id,
+            "error",
+            error={
+                "type": e.__class__.__name__,
+                "message": str(e),
+            },
+        )
+        try:
+            existing = find_response_for_request_id(client.list_comments(claimed.number), req_id)
+            if existing is None:
+                client.add_comment(claimed.number, format_response_comment(resp))
+            response_written = True
+        except Exception as comment_error:
+            rollback_claim(
+                client,
+                claimed.number,
+                worker_id,
+                f"response comment failed after retries: {comment_error}",
+            )
+            raise RuntimeError(
+                f"issue #{claimed.number} failed and was returned to pending queue: {comment_error}"
+            ) from comment_error
+
+    try:
+        ensure_response_event_issue(client, resp)
+        finalize_issue(client, claimed.number, worker_id)
+    except Exception as finalize_error:
+        if not response_written:
+            rollback_claim(
+                client,
+                claimed.number,
+                worker_id,
+                f"finalize failed before response persisted: {finalize_error}",
+            )
+        raise RuntimeError(
+            f"issue #{claimed.number} response persisted but finalization is incomplete: {finalize_error}"
+        ) from finalize_error
+
+    return {"issue": claimed.number, "status": "processed", "request_id": resp["request_id"]}
+
+
+def run_once(client: GitHubQueueClient, worker_id: str):
     issues = client.list_open_cmd_issues(per_page=30)
+    processed = 0
+    skipped = 0
     for issue in issues:
-        process_one_issue(client, issue)
-    return len(issues)
+        result = process_one_issue(client, issue, worker_id)
+        if result["status"] == "processed":
+            processed += 1
+        else:
+            skipped += 1
+    return {"seen": len(issues), "processed": processed, "skipped": skipped}
 
 
-def run_loop(client: GitHubQueueClient, interval: int):
+def run_loop(client: GitHubQueueClient, interval: int, worker_id: str):
     while True:
-        cnt = run_once(client)
-        print(f"[{dt.datetime.utcnow().isoformat()}Z] processed={cnt}")
+        result = run_once(client, worker_id)
+        print(
+            f"[{utc_now_iso()}] "
+            f"seen={result['seen']} processed={result['processed']} skipped={result['skipped']}"
+        )
         time.sleep(interval)
 
 
@@ -100,12 +238,13 @@ def main():
 
     args = p.parse_args()
     client = make_client()
+    worker_id = os.getenv("CHANNEL_WORKER_ID", "").strip() or make_worker_id()
 
     if args.mode == "once":
-        count = run_once(client)
-        print(f"processed={count}")
+        result = run_once(client, worker_id)
+        print(json.dumps(result, ensure_ascii=False))
     else:
-        run_loop(client, args.interval)
+        run_loop(client, args.interval, worker_id)
 
 
 if __name__ == "__main__":

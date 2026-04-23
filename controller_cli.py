@@ -43,7 +43,10 @@ def wait_response(client: GitHubQueueClient, issue_number: int, request_id: str,
             if r.get("request_id") == request_id:
                 return r
         time.sleep(interval)
-    raise TimeoutError("wait response timeout")
+    waited = int(time.time() - start)
+    raise TimeoutError(
+        f"wait response timeout for request_id={request_id} issue={issue_number} after {waited}s"
+    )
 
 
 def cmd_enqueue(args):

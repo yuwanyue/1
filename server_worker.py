@@ -64,18 +64,37 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
         raise ValueError("egress.fetch requires args.url")
+
     method = str(args.get("method", "GET")).upper().strip() or "GET"
-    body_text = str(args.get("body", ""))
-    request_id = str(args.get("request_id", f"eg_{int(time.time())}_{uuid4().hex[:8]}"))
+    mode = str(args.get("mode", "fetch")).strip() or "fetch"
     workflow = str(args.get("workflow", os.getenv("CHANNEL_EGRESS_WORKFLOW", "egress-fetch.yml")))
+    request_id = str(args.get("request_id", f"eg_{int(time.time())}_{uuid4().hex[:8]}"))
+
+    body_text = str(args.get("body", ""))
+    browser_script = str(args.get("browser_script", ""))
+    terminal_cmd = str(args.get("terminal_cmd", ""))
+    browser_wait_ms = str(args.get("browser_wait_ms", "3000"))
+    browser_headless = str(args.get("browser_headless", "true"))
 
     body_b64 = base64.b64encode(body_text.encode("utf-8")).decode("ascii") if body_text else ""
+    browser_script_b64 = (
+        base64.b64encode(browser_script.encode("utf-8")).decode("ascii") if browser_script else ""
+    )
+    terminal_cmd_b64 = (
+        base64.b64encode(terminal_cmd.encode("utf-8")).decode("ascii") if terminal_cmd else ""
+    )
+
     dispatch_payload = {
         "ref": os.getenv("CHANNEL_EGRESS_REF", "main"),
         "inputs": {
             "url": url,
             "method": method,
             "body_b64": body_b64,
+            "mode": mode,
+            "browser_script_b64": browser_script_b64,
+            "terminal_cmd_b64": terminal_cmd_b64,
+            "browser_wait_ms": browser_wait_ms,
+            "browser_headless": browser_headless,
             "request_id": request_id,
         },
     }
@@ -132,6 +151,10 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
     headers_preview = ""
     body_preview = ""
     body_b64_out = ""
+    page = {}
+    command = {}
+    terminal_stdout_preview = ""
+    terminal_stderr_preview = ""
 
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
         members = {m.name: m for m in tf.getmembers()}
@@ -144,13 +167,32 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
                     return v
             return None
 
+        def _read_text(name: str, limit: int | None = None) -> str:
+            member = _member_by_suffix(name)
+            if member is None:
+                return ""
+            f = tf.extractfile(member)
+            if f is None:
+                return ""
+            data = f.read(limit) if isinstance(limit, int) and limit > 0 else f.read()
+            return data.decode("utf-8", "replace")
+
+        def _read_json(name: str):
+            text = _read_text(name)
+            if not text:
+                return {}
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {}
+
         m_status = _member_by_suffix("status_code.txt")
         if m_status is not None:
             status_code = tf.extractfile(m_status).read().decode("utf-8", "replace").strip()
 
         m_headers = _member_by_suffix("headers.txt")
         if m_headers is not None:
-            headers_preview = tf.extractfile(m_headers).read(2048).decode("utf-8", "replace")
+            headers_preview = tf.extractfile(m_headers).read(4096).decode("utf-8", "replace")
 
         m_body = _member_by_suffix("body.bin")
         if m_body is not None:
@@ -158,15 +200,27 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
             body_preview = body[:1000].decode("utf-8", "replace")
             body_b64_out = base64.b64encode(body[:32768]).decode("ascii")
 
+        page = _read_json("page.json")
+        command = _read_json("command.json")
+        terminal_stdout_preview = _read_text("terminal_stdout.txt", limit=2000)
+        terminal_stderr_preview = _read_text("terminal_stderr.txt", limit=2000)
+
     return {
         "request_id": request_id,
         "run_id": run_id,
         "url": url,
         "method": method,
+        "mode": mode,
         "status_code": status_code,
         "headers_preview": headers_preview,
         "body_preview": body_preview,
         "body_b64_head": body_b64_out,
+        "page": page,
+        "command": command,
+        "terminal_stdout_preview": terminal_stdout_preview,
+        "terminal_stderr_preview": terminal_stderr_preview,
+        "has_browser_artifacts": mode in {"screenshot", "browser"},
+        "has_terminal_artifacts": bool(terminal_cmd),
     }
 
 

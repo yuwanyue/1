@@ -1,6 +1,9 @@
 import os
+import io
 import json
+import tarfile
 import unittest
+from unittest import mock
 
 from channel_common import Issue, format_response_comment
 from controller_cli import enqueue, replay_issue, requeue_issue
@@ -15,6 +18,7 @@ from server_worker import (
     finalize_issue,
     lease_label,
     process_one_issue,
+    run_github_egress_fetch,
     run_once,
 )
 
@@ -185,6 +189,81 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["stats"]["errors"], 0)
         self.assertEqual(result["results"][0]["issue"], 1)
         self.assertEqual(result["worker_id"], "worker-a")
+
+
+class EgressFetchTests(unittest.TestCase):
+    def _make_archive(self):
+        bio = io.BytesIO()
+        with tarfile.open(fileobj=bio, mode="w:gz") as tf:
+            files = {
+                "status_code.txt": b"200\n",
+                "headers.txt": b"HTTP/2 200\ncontent-type: text/html\n",
+                "body.bin": b"hello world",
+                "page.json": json.dumps({"title": "Example", "final_url": "https://example.com"}).encode("utf-8"),
+                "command.json": json.dumps({"exit_code": 0}).encode("utf-8"),
+                "terminal_stdout.txt": b"ok\n",
+                "terminal_stderr.txt": b"",
+            }
+            for name, data in files.items():
+                info = tarfile.TarInfo(name=f"out/{name}")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        return bio.getvalue()
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "GITHUB_TOKEN": "t",
+            "CHANNEL_OWNER": "owner",
+            "CHANNEL_REPO": "repo",
+        },
+        clear=False,
+    )
+    @mock.patch("server_worker.time.sleep", return_value=None)
+    @mock.patch("server_worker._download_bytes")
+    @mock.patch("server_worker._api_json")
+    def test_run_github_egress_fetch_supports_browser_and_terminal_inputs(self, api_json, download_bytes, _sleep):
+        download_bytes.return_value = self._make_archive()
+
+        def fake_api(method, url, token, payload=None):
+            if method == "POST" and "/dispatches" in url:
+                self.assertIn("inputs", payload)
+                inputs = payload["inputs"]
+                self.assertEqual(inputs["mode"], "browser")
+                self.assertTrue(inputs["browser_script_b64"])
+                self.assertTrue(inputs["terminal_cmd_b64"])
+                return {}
+            if method == "GET" and "/runs?" in url:
+                return {"workflow_runs": [{"id": 123, "display_title": "egress-fetch req-1"}]}
+            if method == "GET" and "/actions/runs/123" in url:
+                return {"status": "completed", "conclusion": "success"}
+            if method == "GET" and "/releases/tags/run-123" in url:
+                return {"assets": [{"browser_download_url": "https://example.com/result.tgz"}]}
+            raise AssertionError(f"unexpected call: {method} {url}")
+
+        api_json.side_effect = fake_api
+
+        out = run_github_egress_fetch(
+            {
+                "url": "https://example.com",
+                "method": "GET",
+                "mode": "browser",
+                "request_id": "req-1",
+                "browser_script": "await page.waitForTimeout(10); return {ok:true};",
+                "terminal_cmd": "echo ok",
+                "max_wait_seconds": 3,
+                "poll_interval_seconds": 1,
+            }
+        )
+
+        self.assertEqual(out["run_id"], "123")
+        self.assertEqual(out["mode"], "browser")
+        self.assertEqual(out["status_code"], "200")
+        self.assertEqual(out["page"]["title"], "Example")
+        self.assertEqual(out["command"]["exit_code"], 0)
+        self.assertIn("ok", out["terminal_stdout_preview"])
+        self.assertTrue(out["has_browser_artifacts"])
+        self.assertTrue(out["has_terminal_artifacts"])
 
 
 class ControllerTests(unittest.TestCase):

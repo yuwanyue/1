@@ -20,9 +20,29 @@ on:
         default: ""
         type: string
       mode:
-        description: fetch or screenshot
+        description: fetch | screenshot | browser | shell
         required: false
         default: fetch
+        type: string
+      browser_script_b64:
+        description: base64 JS snippet (async) for advanced Playwright actions
+        required: false
+        default: ""
+        type: string
+      terminal_cmd_b64:
+        description: base64 shell command to run with bash -lc
+        required: false
+        default: ""
+        type: string
+      browser_wait_ms:
+        description: extra wait time after goto (ms)
+        required: false
+        default: "3000"
+        type: string
+      browser_headless:
+        description: true/false for Playwright launch
+        required: false
+        default: "true"
         type: string
       request_id:
         description: caller-generated id for polling the correct run
@@ -35,8 +55,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
-      - name: Fetch target
+      - name: Execute egress action
         continue-on-error: true
         env:
           URL: ${{ inputs.url }}
@@ -44,62 +65,152 @@ jobs:
           BODY_B64: ${{ inputs.body_b64 }}
           MODE: ${{ inputs.mode }}
           REQUEST_ID: ${{ inputs.request_id }}
+          BROWSER_SCRIPT_B64: ${{ inputs.browser_script_b64 }}
+          TERMINAL_CMD_B64: ${{ inputs.terminal_cmd_b64 }}
+          BROWSER_WAIT_MS: ${{ inputs.browser_wait_ms }}
+          BROWSER_HEADLESS: ${{ inputs.browser_headless }}
         run: |
           set -uo pipefail
           mkdir -p out
           ts=$(date -u +%Y%m%dT%H%M%SZ)
+
           printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
             "$URL" "$METHOD" "$MODE" "$ts" "${GITHUB_RUN_ID}" "$REQUEST_ID" > out/meta.json
-          fetch_exit=0
 
-          if [ "$MODE" = "screenshot" ]; then
+          fetch_exit=0
+          cmd_exit=""
+
+          run_browser=0
+          if [ "$MODE" = "screenshot" ] || [ "$MODE" = "browser" ]; then
+            run_browser=1
+          fi
+
+          if [ "$run_browser" -eq 1 ]; then
             npm init -y >/dev/null 2>>out/error.txt || fetch_exit=$?
             npm install playwright >/dev/null 2>>out/error.txt || fetch_exit=$?
-            npx playwright install chromium >/dev/null 2>>out/error.txt || fetch_exit=$?
+            npx playwright install --with-deps chromium >/dev/null 2>>out/error.txt || fetch_exit=$?
+
             cat > out/capture.mjs <<'EOF'
             import fs from "node:fs";
+            import path from "node:path";
             import { chromium } from "playwright";
 
-            const url = process.env.URL;
             const outDir = "out";
-            const browser = await chromium.launch({ headless: true });
-            const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
+            const url = process.env.URL;
+            const waitMs = Number.parseInt(process.env.BROWSER_WAIT_MS || "3000", 10);
+            const browserScriptB64 = process.env.BROWSER_SCRIPT_B64 || "";
+            const headless = (process.env.BROWSER_HEADLESS || "true").toLowerCase() !== "false";
+
             let status = "unknown";
             let finalUrl = url;
             let title = "";
+            let htmlPath = "";
+            let scriptError = "";
             let error = "";
+            let scriptResult = null;
+            const consoleLogs = [];
+
+            const browser = await chromium.launch({ headless });
+            const context = await browser.newContext({ viewport: { width: 1440, height: 1080 } });
+            const page = await context.newPage();
+
+            page.on("console", (msg) => {
+              try {
+                consoleLogs.push(`[${msg.type()}] ${msg.text()}`);
+              } catch {
+                consoleLogs.push("[console] <unavailable>");
+              }
+            });
+
+            await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+
             try {
               const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-              await page.waitForTimeout(3000);
-              if (response) {
-                status = String(response.status());
+              if (response) status = String(response.status());
+              if (Number.isFinite(waitMs) && waitMs > 0) {
+                await page.waitForTimeout(waitMs);
               }
+
+              if (browserScriptB64) {
+                try {
+                  const script = Buffer.from(browserScriptB64, "base64").toString("utf8");
+                  const fn = new Function(
+                    "ctx",
+                    `"use strict"; return (async () => { ${script}\n })();`,
+                  );
+                  const rawResult = await fn({ page, context, browser, fs, path, console });
+                  if (typeof rawResult === "undefined") {
+                    scriptResult = null;
+                  } else if (typeof rawResult === "string" || typeof rawResult === "number" || typeof rawResult === "boolean") {
+                    scriptResult = rawResult;
+                  } else {
+                    scriptResult = JSON.parse(JSON.stringify(rawResult));
+                  }
+                } catch (err) {
+                  scriptError = err instanceof Error ? err.stack || err.message : String(err);
+                }
+              }
+
               finalUrl = page.url();
               title = await page.title();
+
+              await page.screenshot({ path: `${outDir}/screenshot.png`, fullPage: true });
+              const html = await page.content();
+              htmlPath = `${outDir}/page.html`;
+              fs.writeFileSync(htmlPath, html, "utf8");
             } catch (err) {
-              error = err instanceof Error ? err.message : String(err);
+              error = err instanceof Error ? err.stack || err.message : String(err);
+              try {
+                await page.screenshot({ path: `${outDir}/screenshot.error.png`, fullPage: true });
+              } catch {
+                // ignore
+              }
             } finally {
               try {
-                await page.screenshot({ path: `${outDir}/screenshot.png`, fullPage: true });
+                await context.tracing.stop({ path: `${outDir}/trace.zip` });
               } catch (err) {
-                if (!error) {
-                  error = err instanceof Error ? err.message : String(err);
-                }
+                if (!error) error = err instanceof Error ? err.message : String(err);
               }
               await browser.close();
             }
+
             fs.writeFileSync(
               `${outDir}/page.json`,
-              JSON.stringify({ title, final_url: finalUrl, error }, null, 2),
+              JSON.stringify(
+                {
+                  title,
+                  final_url: finalUrl,
+                  status,
+                  script_result: scriptResult,
+                  script_error: scriptError,
+                  error,
+                  html_path: htmlPath,
+                },
+                null,
+                2,
+              ),
             );
             fs.writeFileSync(`${outDir}/status_code.txt`, `${status}\n`);
-            fs.writeFileSync(`${outDir}/headers.txt`, `mode=screenshot\nfinal_url=${finalUrl}\nerror=${error}\n`);
-            if (error) {
-              fs.writeFileSync(`${outDir}/error.txt`, `${error}\n`);
+            fs.writeFileSync(
+              `${outDir}/headers.txt`,
+              [
+                `mode=${process.env.MODE || "browser"}`,
+                `final_url=${finalUrl}`,
+                `title=${title}`,
+                `script_error=${scriptError}`,
+                `error=${error}`,
+              ].join("\n") + "\n",
+            );
+            fs.writeFileSync(`${outDir}/browser_console.log`, consoleLogs.join("\n"), "utf8");
+            if (error || scriptError) {
+              fs.writeFileSync(`${outDir}/error.txt`, `${error}\n${scriptError}\n`);
             }
             EOF
+
             node out/capture.mjs >>out/error.txt 2>&1 || fetch_exit=$?
-          else
+          fi
+
+          if [ "$MODE" = "fetch" ]; then
             if [ -n "$BODY_B64" ]; then
               echo "$BODY_B64" | base64 -d > out/req_body.bin || true
               curl -sS -L -X "$METHOD" \
@@ -111,19 +222,41 @@ jobs:
                 --connect-timeout 15 --max-time 120 \
                 -D out/headers.txt -o out/body.bin "$URL" >>out/error.txt 2>&1 || fetch_exit=$?
             fi
-
             code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt 2>/dev/null || true)
             echo "${code:-unknown}" > out/status_code.txt
           fi
+
+          if [ -n "$TERMINAL_CMD_B64" ]; then
+            echo "$TERMINAL_CMD_B64" | base64 -d > out/terminal_command.sh 2>>out/error.txt || true
+            chmod +x out/terminal_command.sh || true
+            if [ -s out/terminal_command.sh ]; then
+              set +e
+              bash -lc "$(cat out/terminal_command.sh)" > out/terminal_stdout.txt 2> out/terminal_stderr.txt
+              cmd_exit=$?
+              set -e
+            else
+              cmd_exit=0
+            fi
+          else
+            cmd_exit=0
+          fi
+
+          printf '{"exit_code":%s}\n' "${cmd_exit:-0}" > out/command.json
 
           [ -f out/status_code.txt ] || echo "unknown" > out/status_code.txt
           [ -f out/headers.txt ] || : > out/headers.txt
           [ -f out/body.bin ] || : > out/body.bin
           [ -f out/page.json ] || printf '{"title":"","final_url":"%s","error":""}\n' "$URL" > out/page.json
+          [ -f out/browser_console.log ] || : > out/browser_console.log
+          [ -f out/terminal_stdout.txt ] || : > out/terminal_stdout.txt
+          [ -f out/terminal_stderr.txt ] || : > out/terminal_stderr.txt
+          [ -f out/terminal_command.sh ] || : > out/terminal_command.sh
+
           if [ "$fetch_exit" -ne 0 ]; then
             printf '\ncommand_exit=%s\n' "$fetch_exit" >> out/error.txt
           fi
           true
+
       - name: Package result
         if: always()
         run: |
@@ -134,7 +267,16 @@ jobs:
           [ -f out/body.bin ] || : > out/body.bin
           [ -f out/page.json ] || echo '{"title":"","final_url":"","error":"fetch step aborted"}' > out/page.json
           [ -f out/meta.json ] || echo '{}' > out/meta.json
+          [ -f out/command.json ] || echo '{"exit_code":0}' > out/command.json
           tar -czf result.tgz -C out .
+
+      - name: Upload workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egress-result-${{ github.run_id }}
+          path: result.tgz
+          if-no-files-found: warn
 
       - name: Create release tag
         id: vars
@@ -142,6 +284,7 @@ jobs:
           echo "tag=run-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
 
       - name: Publish release with asset
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.vars.outputs.tag }}

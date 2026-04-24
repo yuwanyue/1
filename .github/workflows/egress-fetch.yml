@@ -75,7 +75,9 @@ jobs:
           mkdir -p out
           : > out/error.txt
           : > out/browser_console.log
+          : > out/step-marker.txt
           trap 'rc=$?; echo "shell_err_line=$LINENO rc=$rc" >> out/error.txt' ERR
+          echo "step=start" >> out/step-marker.txt
           ts=$(date -u +%Y%m%dT%H%M%SZ)
 
           printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
@@ -90,6 +92,7 @@ jobs:
           fi
 
           if [ "$run_browser" -eq 1 ]; then
+            echo "step=browser_setup_begin" >> out/step-marker.txt
             {
               echo "== browser setup =="
               echo "pwd=$(pwd)"
@@ -101,13 +104,18 @@ jobs:
             } >> out/error.txt 2>&1
 
             sudo apt-get update >>out/error.txt 2>&1 || fetch_exit=$?
+            echo "step=after_apt_update" >> out/step-marker.txt
             sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fontconfig >>out/error.txt 2>&1 || fetch_exit=$?
+            echo "step=after_font_install" >> out/step-marker.txt
             fc-cache -fv >>out/error.txt 2>&1 || true
             fc-match "Noto Sans CJK SC" >>out/error.txt 2>&1 || true
 
             npm init -y >>out/error.txt 2>&1 || fetch_exit=$?
+            echo "step=after_npm_init" >> out/step-marker.txt
             npm install playwright >>out/error.txt 2>&1 || fetch_exit=$?
+            echo "step=after_npm_install" >> out/step-marker.txt
             npx playwright install chromium >>out/error.txt 2>&1 || fetch_exit=$?
+            echo "step=after_playwright_install" >> out/step-marker.txt
 
             cat > out/capture.mjs <<'EOF'
             import fs from "node:fs";
@@ -240,11 +248,14 @@ jobs:
               fs.writeFileSync(`${outDir}/error.txt`, `${error}\n${scriptError}\n`);
             }
             EOF
+            echo "step=after_capture_script_write" >> out/step-marker.txt
 
             node out/capture.mjs >>out/error.txt 2>&1 || fetch_exit=$?
+            echo "step=after_capture_script_run" >> out/step-marker.txt
           fi
 
           if [ "$MODE" = "fetch" ]; then
+            echo "step=fetch_begin" >> out/step-marker.txt
             if [ -n "$BODY_B64" ]; then
               echo "$BODY_B64" | base64 -d > out/req_body.bin || true
               curl -sS -L -X "$METHOD" \
@@ -258,9 +269,11 @@ jobs:
             fi
             code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt 2>/dev/null || true)
             echo "${code:-unknown}" > out/status_code.txt
+            echo "step=after_fetch" >> out/step-marker.txt
           fi
 
           if [ -n "$TERMINAL_CMD_B64" ]; then
+            echo "step=terminal_begin" >> out/step-marker.txt
             echo "$TERMINAL_CMD_B64" | base64 -d > out/terminal_command.sh 2>>out/error.txt || true
             chmod +x out/terminal_command.sh || true
             if [ -s out/terminal_command.sh ]; then
@@ -275,6 +288,7 @@ jobs:
             cmd_exit=0
           fi
 
+          echo "step=before_command_json" >> out/step-marker.txt
           printf '{"exit_code":%s}\n' "${cmd_exit:-0}" > out/command.json
 
           [ -f out/status_code.txt ] || echo "unknown" > out/status_code.txt
@@ -289,6 +303,7 @@ jobs:
           if [ "$fetch_exit" -ne 0 ]; then
             printf '\ncommand_exit=%s\n' "$fetch_exit" >> out/error.txt
           fi
+          echo "step=done" >> out/step-marker.txt
           true
 
       - name: Package result
@@ -303,6 +318,7 @@ jobs:
           [ -f out/page.json ] || echo '{"title":"","final_url":"","error":"fetch step aborted"}' > out/page.json
           [ -f out/meta.json ] || echo '{}' > out/meta.json
           [ -f out/command.json ] || echo '{"exit_code":0}' > out/command.json
+          [ -f out/step-marker.txt ] || echo 'step=package_fallback_only' > out/step-marker.txt
           tar -czf result.tgz -C out .
 
       - name: Upload workflow artifact

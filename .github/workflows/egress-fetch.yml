@@ -56,95 +56,89 @@ jobs:
     permissions:
       contents: write
       actions: read
+    env:
+      URL: ${{ inputs.url }}
+      METHOD: ${{ inputs.method }}
+      BODY_B64: ${{ inputs.body_b64 }}
+      MODE: ${{ inputs.mode }}
+      REQUEST_ID: ${{ inputs.request_id }}
+      BROWSER_SCRIPT_B64: ${{ inputs.browser_script_b64 }}
+      TERMINAL_CMD_B64: ${{ inputs.terminal_cmd_b64 }}
+      BROWSER_WAIT_MS: ${{ inputs.browser_wait_ms }}
+      BROWSER_HEADLESS: ${{ inputs.browser_headless }}
     steps:
-      - name: Execute egress action
-        continue-on-error: true
+      - name: Prepare output
         shell: bash {0}
-        env:
-          URL: ${{ inputs.url }}
-          METHOD: ${{ inputs.method }}
-          BODY_B64: ${{ inputs.body_b64 }}
-          MODE: ${{ inputs.mode }}
-          REQUEST_ID: ${{ inputs.request_id }}
-          BROWSER_SCRIPT_B64: ${{ inputs.browser_script_b64 }}
-          TERMINAL_CMD_B64: ${{ inputs.terminal_cmd_b64 }}
-          BROWSER_WAIT_MS: ${{ inputs.browser_wait_ms }}
-          BROWSER_HEADLESS: ${{ inputs.browser_headless }}
         run: |
           set -u -o pipefail
           mkdir -p out
-          : > out/error.txt
-          : > out/browser_console.log
-          : > out/step-marker.txt
-          trap 'rc=$?; echo "shell_err_line=$LINENO rc=$rc" >> out/error.txt' ERR
-          echo "step=start" >> out/step-marker.txt
           ts=$(date -u +%Y%m%dT%H%M%SZ)
-
           printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
             "$URL" "$METHOD" "$MODE" "$ts" "${GITHUB_RUN_ID}" "$REQUEST_ID" > out/meta.json
+          : > out/error.txt
+          : > out/browser_console.log
+          echo "step=prepare" > out/step-marker.txt
+          echo '{"exit_code":0}' > out/command.json
 
-          fetch_exit=0
-          cmd_exit=""
+      - name: Browser capture
+        if: ${{ inputs.mode == 'screenshot' || inputs.mode == 'browser' }}
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          set -u -o pipefail
+          echo "step=browser_begin" >> out/step-marker.txt
+          {
+            echo "== browser setup =="
+            echo "pwd=$(pwd)"
+            command -v node || true
+            command -v npm || true
+            command -v npx || true
+            node -v || true
+            npm -v || true
+          } >> out/error.txt 2>&1
 
-          run_browser=0
-          if [ "$MODE" = "screenshot" ] || [ "$MODE" = "browser" ]; then
-            run_browser=1
-          fi
+          sudo apt-get update >> out/error.txt 2>&1 || true
+          sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fontconfig >> out/error.txt 2>&1 || true
+          fc-cache -fv >> out/error.txt 2>&1 || true
+          fc-match "Noto Sans CJK SC" >> out/error.txt 2>&1 || true
+          echo "step=browser_fonts_ready" >> out/step-marker.txt
 
-          if [ "$run_browser" -eq 1 ]; then
-            echo "step=browser_setup_begin" >> out/step-marker.txt
-            {
-              echo "== browser setup =="
-              echo "pwd=$(pwd)"
-              echo "node=$(command -v node || true)"
-              echo "npm=$(command -v npm || true)"
-              echo "npx=$(command -v npx || true)"
-              node -v || true
-              npm -v || true
-            } >> out/error.txt 2>&1
+          npm init -y >> out/error.txt 2>&1 || true
+          npm install playwright >> out/error.txt 2>&1 || true
+          npx playwright install chromium >> out/error.txt 2>&1 || true
+          echo "step=browser_runtime_ready" >> out/step-marker.txt
 
-            sudo apt-get update >>out/error.txt 2>&1 || fetch_exit=$?
-            echo "step=after_apt_update" >> out/step-marker.txt
-            sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fontconfig >>out/error.txt 2>&1 || fetch_exit=$?
-            echo "step=after_font_install" >> out/step-marker.txt
-            fc-cache -fv >>out/error.txt 2>&1 || true
-            fc-match "Noto Sans CJK SC" >>out/error.txt 2>&1 || true
+          cat > out/capture.mjs <<'EOF'
+          import fs from "node:fs";
+          import path from "node:path";
+          import { chromium } from "playwright";
 
-            npm init -y >>out/error.txt 2>&1 || fetch_exit=$?
-            echo "step=after_npm_init" >> out/step-marker.txt
-            npm install playwright >>out/error.txt 2>&1 || fetch_exit=$?
-            echo "step=after_npm_install" >> out/step-marker.txt
-            npx playwright install chromium >>out/error.txt 2>&1 || fetch_exit=$?
-            echo "step=after_playwright_install" >> out/step-marker.txt
+          const outDir = "out";
+          const url = process.env.URL;
+          const waitMs = Number.parseInt(process.env.BROWSER_WAIT_MS || "3000", 10);
+          const browserScriptB64 = process.env.BROWSER_SCRIPT_B64 || "";
+          const headless = (process.env.BROWSER_HEADLESS || "true").toLowerCase() !== "false";
 
-            cat > out/capture.mjs <<'EOF'
-            import fs from "node:fs";
-            import path from "node:path";
-            import { chromium } from "playwright";
+          const consoleLogs = [];
+          let status = "unknown";
+          let finalUrl = url;
+          let title = "";
+          let htmlPath = "";
+          let scriptResult = null;
+          let scriptError = "";
+          let error = "";
 
-            const outDir = "out";
-            const url = process.env.URL;
-            const waitMs = Number.parseInt(process.env.BROWSER_WAIT_MS || "3000", 10);
-            const browserScriptB64 = process.env.BROWSER_SCRIPT_B64 || "";
-            const headless = (process.env.BROWSER_HEADLESS || "true").toLowerCase() !== "false";
+          const marker = (name) => fs.appendFileSync(`${outDir}/step-marker.txt`, `${name}\n`, "utf8");
+          marker("step=node_script_start");
 
-            let status = "unknown";
-            let finalUrl = url;
-            let title = "";
-            let htmlPath = "";
-            let scriptError = "";
-            let error = "";
-            let scriptResult = null;
-            const consoleLogs = [];
-
-            fs.writeFileSync(`${outDir}/step-marker.txt`, "capture-script-started\n", "utf8");
-
+          try {
             const browser = await chromium.launch({ headless });
             const context = await browser.newContext({
               viewport: { width: 1440, height: 1080 },
               locale: "zh-CN",
               timezoneId: "Asia/Shanghai",
             });
+
             await context.addInitScript(() => {
               const style = document.createElement("style");
               style.textContent = `
@@ -154,8 +148,8 @@ jobs:
               `;
               document.documentElement.appendChild(style);
             });
-            const page = await context.newPage();
 
+            const page = await context.newPage();
             page.on("console", (msg) => {
               try {
                 consoleLogs.push(`[${msg.type()}] ${msg.text()}`);
@@ -165,6 +159,7 @@ jobs:
             });
 
             await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+            marker("step=node_browser_launched");
 
             try {
               const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
@@ -195,11 +190,12 @@ jobs:
 
               finalUrl = page.url();
               title = await page.title();
-
+              marker("step=node_page_loaded");
               await page.screenshot({ path: `${outDir}/screenshot.png`, fullPage: true });
               const html = await page.content();
               htmlPath = `${outDir}/page.html`;
               fs.writeFileSync(htmlPath, html, "utf8");
+              marker("step=node_screenshot_written");
             } catch (err) {
               error = err instanceof Error ? err.stack || err.message : String(err);
               try {
@@ -215,110 +211,103 @@ jobs:
               }
               await browser.close();
             }
+          } catch (err) {
+            error = err instanceof Error ? err.stack || err.message : String(err);
+          }
 
-            fs.writeFileSync(
-              `${outDir}/page.json`,
-              JSON.stringify(
-                {
-                  title,
-                  final_url: finalUrl,
-                  status,
-                  script_result: scriptResult,
-                  script_error: scriptError,
-                  error,
-                  html_path: htmlPath,
-                },
-                null,
-                2,
-              ),
-            );
-            fs.writeFileSync(`${outDir}/status_code.txt`, `${status}\n`);
-            fs.writeFileSync(
-              `${outDir}/headers.txt`,
-              [
-                `mode=${process.env.MODE || "browser"}`,
-                `final_url=${finalUrl}`,
-                `title=${title}`,
-                `script_error=${scriptError}`,
-                `error=${error}`,
-              ].join("\n") + "\n",
-            );
-            fs.writeFileSync(`${outDir}/browser_console.log`, consoleLogs.join("\n"), "utf8");
-            if (error || scriptError) {
-              fs.writeFileSync(`${outDir}/error.txt`, `${error}\n${scriptError}\n`);
-            }
-            EOF
-            echo "step=after_capture_script_write" >> out/step-marker.txt
+          fs.writeFileSync(
+            `${outDir}/page.json`,
+            JSON.stringify(
+              {
+                title,
+                final_url: finalUrl,
+                status,
+                script_result: scriptResult,
+                script_error: scriptError,
+                error,
+                html_path: htmlPath,
+              },
+              null,
+              2,
+            ),
+          );
+          fs.writeFileSync(`${outDir}/status_code.txt`, `${status}\n`);
+          fs.writeFileSync(
+            `${outDir}/headers.txt`,
+            [
+              `mode=${process.env.MODE || "browser"}`,
+              `final_url=${finalUrl}`,
+              `title=${title}`,
+              `script_error=${scriptError}`,
+              `error=${error}`,
+            ].join("\n") + "\n",
+          );
+          fs.writeFileSync(`${outDir}/browser_console.log`, consoleLogs.join("\n"), "utf8");
+          if (error || scriptError) {
+            fs.appendFileSync(`${outDir}/error.txt`, `${error}\n${scriptError}\n`, "utf8");
+          }
+          marker("step=node_script_done");
+          EOF
 
-            node out/capture.mjs >>out/error.txt 2>&1 || fetch_exit=$?
-            echo "step=after_capture_script_run" >> out/step-marker.txt
-          fi
+          node out/capture.mjs >> out/error.txt 2>&1 || true
+          echo "step=browser_step_done" >> out/step-marker.txt
 
-          if [ "$MODE" = "fetch" ]; then
-            echo "step=fetch_begin" >> out/step-marker.txt
-            if [ -n "$BODY_B64" ]; then
-              echo "$BODY_B64" | base64 -d > out/req_body.bin || true
-              curl -sS -L -X "$METHOD" \
-                --connect-timeout 15 --max-time 120 \
-                --data-binary @out/req_body.bin \
-                -D out/headers.txt -o out/body.bin "$URL" >>out/error.txt 2>&1 || fetch_exit=$?
-            else
-              curl -sS -L -X "$METHOD" \
-                --connect-timeout 15 --max-time 120 \
-                -D out/headers.txt -o out/body.bin "$URL" >>out/error.txt 2>&1 || fetch_exit=$?
-            fi
-            code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt 2>/dev/null || true)
-            echo "${code:-unknown}" > out/status_code.txt
-            echo "step=after_fetch" >> out/step-marker.txt
-          fi
-
-          if [ -n "$TERMINAL_CMD_B64" ]; then
-            echo "step=terminal_begin" >> out/step-marker.txt
-            echo "$TERMINAL_CMD_B64" | base64 -d > out/terminal_command.sh 2>>out/error.txt || true
-            chmod +x out/terminal_command.sh || true
-            if [ -s out/terminal_command.sh ]; then
-              set +e
-              bash -lc "$(cat out/terminal_command.sh)" > out/terminal_stdout.txt 2> out/terminal_stderr.txt
-              cmd_exit=$?
-              set -e
-            else
-              cmd_exit=0
-            fi
+      - name: HTTP fetch
+        if: ${{ inputs.mode == 'fetch' }}
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          set -u -o pipefail
+          echo "step=fetch_begin" >> out/step-marker.txt
+          if [ -n "$BODY_B64" ]; then
+            echo "$BODY_B64" | base64 -d > out/req_body.bin || true
+            curl -sS -L -X "$METHOD" \
+              --connect-timeout 15 --max-time 120 \
+              --data-binary @out/req_body.bin \
+              -D out/headers.txt -o out/body.bin "$URL" >> out/error.txt 2>&1 || true
           else
-            cmd_exit=0
+            curl -sS -L -X "$METHOD" \
+              --connect-timeout 15 --max-time 120 \
+              -D out/headers.txt -o out/body.bin "$URL" >> out/error.txt 2>&1 || true
           fi
+          code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt 2>/dev/null || true)
+          echo "${code:-unknown}" > out/status_code.txt
+          echo "step=fetch_done" >> out/step-marker.txt
 
-          echo "step=before_command_json" >> out/step-marker.txt
+      - name: Terminal command
+        if: ${{ inputs.terminal_cmd_b64 != '' }}
+        continue-on-error: true
+        shell: bash {0}
+        run: |
+          set -u -o pipefail
+          echo "step=terminal_begin" >> out/step-marker.txt
+          echo "$TERMINAL_CMD_B64" | base64 -d > out/terminal_command.sh 2>> out/error.txt || true
+          chmod +x out/terminal_command.sh || true
+          cmd_exit=0
+          if [ -s out/terminal_command.sh ]; then
+            bash -lc "$(cat out/terminal_command.sh)" > out/terminal_stdout.txt 2> out/terminal_stderr.txt || cmd_exit=$?
+          fi
           printf '{"exit_code":%s}\n' "${cmd_exit:-0}" > out/command.json
+          echo "step=terminal_done" >> out/step-marker.txt
 
+      - name: Finalize output
+        if: always()
+        shell: bash {0}
+        run: |
+          set -u -o pipefail
           [ -f out/status_code.txt ] || echo "unknown" > out/status_code.txt
           [ -f out/headers.txt ] || : > out/headers.txt
           [ -f out/body.bin ] || : > out/body.bin
           [ -f out/page.json ] || printf '{"title":"","final_url":"%s","error":"capture did not create page.json"}\n' "$URL" > out/page.json
+          [ -f out/meta.json ] || echo '{}' > out/meta.json
+          [ -f out/command.json ] || echo '{"exit_code":0}' > out/command.json
           [ -f out/browser_console.log ] || : > out/browser_console.log
           [ -f out/terminal_stdout.txt ] || : > out/terminal_stdout.txt
           [ -f out/terminal_stderr.txt ] || : > out/terminal_stderr.txt
           [ -f out/terminal_command.sh ] || : > out/terminal_command.sh
-
-          if [ "$fetch_exit" -ne 0 ]; then
-            printf '\ncommand_exit=%s\n' "$fetch_exit" >> out/error.txt
-          fi
-          echo "step=done" >> out/step-marker.txt
-          true
-
-      - name: Package result
-        if: always()
-        shell: bash {0}
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          [ -f out/status_code.txt ] || echo "unknown" > out/status_code.txt
-          [ -f out/headers.txt ] || : > out/headers.txt
-          [ -f out/body.bin ] || : > out/body.bin
-          [ -f out/page.json ] || echo '{"title":"","final_url":"","error":"fetch step aborted"}' > out/page.json
-          [ -f out/meta.json ] || echo '{}' > out/meta.json
-          [ -f out/command.json ] || echo '{"exit_code":0}' > out/command.json
-          [ -f out/step-marker.txt ] || echo 'step=package_fallback_only' > out/step-marker.txt
+          [ -f out/error.txt ] || : > out/error.txt
+          [ -f out/step-marker.txt ] || echo 'step=finalize_only' > out/step-marker.txt
+          echo "step=finalize_done" >> out/step-marker.txt
           tar -czf result.tgz -C out .
 
       - name: Upload workflow artifact

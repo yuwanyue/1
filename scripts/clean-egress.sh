@@ -5,4 +5,5 @@ ROOT="${1:-.}"
 ROOT="$(cd "$ROOT" && pwd)"
 
 find "$ROOT" -maxdepth 1 -type d -name 'out_*' -print -exec rm -rf {} +
+find "$ROOT" -maxdepth 1 -type d -name 'egress_archive' -print -exec rm -rf {} +
 find "$ROOT" -type d \( -name '__pycache__' -o -name '.pytest_cache' \) -print -exec rm -rf {} +

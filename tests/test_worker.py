@@ -283,8 +283,64 @@ class EgressFetchTests(unittest.TestCase):
             self.assertTrue(out["has_terminal_artifacts"])
             self.assertTrue(os.path.isdir(out["local_output_dir"]))
             self.assertTrue(os.path.isfile(out["local_archive_path"]))
+            self.assertTrue(os.path.isfile(out["local_index_path"]))
             self.assertTrue(os.path.isfile(os.path.join(out["local_output_dir"], "status_code.txt")))
             self.assertTrue(os.path.isfile(os.path.join(out["local_output_dir"], "page.json")))
+
+    @mock.patch.dict(
+        os.environ,
+        {
+            "GITHUB_TOKEN": "t",
+            "CHANNEL_OWNER": "owner",
+            "CHANNEL_REPO": "repo",
+        },
+        clear=False,
+    )
+    @mock.patch("server_worker.time.sleep", return_value=None)
+    @mock.patch("server_worker._delete_release_and_tag")
+    @mock.patch("server_worker._download_bytes")
+    @mock.patch("server_worker._api_json")
+    def test_run_github_egress_fetch_skips_cleanup_when_disabled(
+        self, api_json, download_bytes, delete_release_and_tag, _sleep
+    ):
+        download_bytes.return_value = self._make_archive()
+
+        def fake_api(method, url, token, payload=None):
+            if method == "POST" and "/dispatches" in url:
+                return {}
+            if method == "GET" and "/runs?" in url:
+                return {"workflow_runs": [{"id": 123, "display_title": "egress-fetch req-2"}]}
+            if method == "GET" and "/actions/runs/123" in url:
+                return {"status": "completed", "conclusion": "success"}
+            if method == "GET" and "/releases/tags/run-123" in url:
+                return {"assets": [{"browser_download_url": "https://example.com/result.tgz"}]}
+            raise AssertionError(f"unexpected call: {method} {url}")
+
+        api_json.side_effect = fake_api
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {"CHANNEL_EGRESS_OUTPUT_DIR": tmpdir},
+            clear=False,
+        ):
+            out = run_github_egress_fetch(
+                {
+                    "url": "https://example.com",
+                    "request_id": "req-2",
+                    "cleanup_release": "false",
+                }
+            )
+
+        self.assertEqual(out["run_id"], "123")
+        delete_release_and_tag.assert_not_called()
+
+    def test_run_github_egress_fetch_blocks_dangerous_terminal_command(self):
+        with self.assertRaises(ValueError):
+            run_github_egress_fetch(
+                {
+                    "url": "https://example.com",
+                    "terminal_cmd": "rm -rf /",
+                }
+            )
 
 
 class ControllerTests(unittest.TestCase):

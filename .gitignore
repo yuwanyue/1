@@ -4,6 +4,7 @@ tests/__pycache__/
 .pytest_cache/
 
 out_*/
+egress_archive/
 
 node_modules/
 npm-cache/

@@ -191,8 +191,38 @@ make test
 - `controller_cli.py replay` 可复制原命令为一条新任务，方便人工回放
 - worker 每轮输出一条 JSON，包含 `seen/processed/replayed/retried/dead_lettered/errors`
 - 仓库已通过 `.gitignore` 忽略 `out_*`、`__pycache__/` 等运行产物
-- 已提供 `make clean-egress` 和 `scripts/clean-egress.sh` 清理本地历史产物
+- 仓库已通过 `.gitignore` 忽略 `out_*`、`egress_archive/`、`__pycache__/` 等运行产物
+- 已提供 `make clean-egress` 和 `scripts/clean-egress.sh` 清理本地历史产物与结构化归档目录
 - egress 浏览器模式已增加 npm 与 Playwright 缓存，减少重复下载与安装
+- `egress.fetch` 的本地归档已按日期与 request_id/run_id 结构化保存，并追加索引文件
+- `terminal_cmd` 默认带有一层危险命令拦截，明显高风险命令会直接拒绝执行
+- 远端 shell 执行已增加超时保护，避免 GitHub runner 无限挂起
+
+---
+
+## 网络访问约定
+
+建议把这套仓库当成统一的外网中转入口来使用：
+
+- GitHub 相关域名可以直接访问
+- 非 GitHub 外网域名、地址和公网下载动作，优先走 `egress.fetch`
+- `curl`、`wget`、`apt`、`npm`、浏览器截图、页面抓取等任务，都适合通过 GitHub Actions 中转再回传本地结果
+
+常见例子：
+
+```bash
+python3 controller_cli.py enqueue egress.fetch --args '{"url":"https://example.com","method":"GET"}'
+```
+
+```bash
+python3 controller_cli.py enqueue egress.fetch --args '{"url":"https://github.com","mode":"shell","terminal_cmd":"mkdir -p out/curl && curl -L https://l2.io/ip > out/curl/ip.txt"}'
+```
+
+```bash
+python3 controller_cli.py enqueue egress.fetch --args '{"url":"https://github.com","mode":"shell","terminal_cmd":"mkdir -p out/pkg && cd out/pkg && sudo apt update && apt-get download ripgrep"}'
+```
+
+如果确实需要执行高风险远端命令，建议显式评估后再通过环境变量放开，而不是默认裸跑。
 
 ---
 
@@ -221,33 +251,15 @@ make test
 - 减少网络抖动导致的失败
 - 降低 GitHub Actions 分钟消耗
 
-### 2) 给远端 shell 命令增加安全边界
+### 2) 继续增强结果归档与保留策略
 
-现在 `terminal_cmd_b64` 可以直接执行任意 `bash -lc` 命令，实战上很好用，但生产环境建议再收口。
-
-建议：
-
-- 增加命令白名单或模式白名单
-- 对高风险命令做显式拦截，例如删除系统目录、改 SSH、改防火墙
-- 增加最大执行时长、最大输出体积、最大归档体积限制
-- 在响应里补充 `timed_out`、`truncated` 之类的状态字段
-
-价值：
-
-- 更适合团队共用
-- 降低误操作和仓库凭据被滥用的风险
-- 让失败原因更可观测
-
-### 3) 增强结果归档与保留策略
-
-当前已经实现了“先下载到本地，再自动清理 release/tag”，这是很实用的一步，但本地结果目录还可以进一步规范。
+当前已经实现了“先下载到本地，再自动清理 release/tag”，并且本地归档已经具备日期目录与索引文件。
 
 建议：
 
-- 增加按日期或 request_id 的目录层级
 - 增加保留天数与自动清理策略
-- 给 `out_*` 增加索引文件，方便快速查找某次请求
 - 明确哪些文件是核心结果，哪些是调试附件
+- 给索引增加更多字段，例如耗时、状态码、是否超时
 
 价值：
 
@@ -255,22 +267,7 @@ make test
 - 本地结果更容易检索
 - 降低磁盘占用失控的概率
 
-### 4) 补一份“网络路由策略”说明
-
-现在仓库已经实际承担了“非 GitHub 外网访问统一经仓库中转”的角色，但 README 里还没有把这条策略单独讲清楚。
-
-建议：
-
-- 增加一节“网络访问约定”
-- 明确 GitHub 域名可直连，其他外网建议走 egress workflow
-- 给出 `curl`、`wget`、`apt`、`npm`、截图这几类常见示例
-
-价值：
-
-- 团队成员更容易理解什么时候该直连，什么时候该走中转
-- 能减少重复沟通和误用
-
-### 5) 增加更贴近真实场景的测试
+### 3) 增加更贴近真实场景的测试
 
 当前单元测试已经覆盖了协议解析、回放、死信、egress 基本流程，这很好。下一步更推荐补：
 
@@ -284,7 +281,7 @@ make test
 - 让这套通道在持续演进时更稳
 - 降低“功能能跑但边界条件出错”的概率
 
-### 6) 增加更完整的运维入口
+### 4) 增加更完整的运维入口
 
 建议补一个轻量入口，例如：
 
@@ -325,11 +322,13 @@ make clean-egress
 - `make worker-once`：处理当前待执行命令一次
 - `make worker-loop`：持续轮询处理命令
 - `make clean-egress`：清理本地 `out_*` 结果目录和 Python 缓存
+- `make recent-egress`：查看最近的 egress 本地归档索引
+- `make env-check`：快速检查关键环境变量是否已设置
 
 建议：
 
 - 定期执行 `make clean-egress`
-- 仅在确实需要排障时保留 `out_*` 目录
+- 仅在确实需要排障时保留 `out_*` 或 `egress_archive/` 目录
 
 如需通过脚本直接清理，也可以执行：
 

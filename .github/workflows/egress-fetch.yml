@@ -53,6 +53,7 @@ on:
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
       actions: read
@@ -302,10 +303,14 @@ jobs:
           echo "$TERMINAL_CMD_B64" | base64 -d > out/terminal_command.sh 2>> out/error.txt || true
           chmod +x out/terminal_command.sh || true
           cmd_exit=0
+          cmd_timed_out=false
           if [ -s out/terminal_command.sh ]; then
-            bash -lc "$(cat out/terminal_command.sh)" > out/terminal_stdout.txt 2> out/terminal_stderr.txt || cmd_exit=$?
+            timeout --signal=TERM 900 bash -lc "$(cat out/terminal_command.sh)" > out/terminal_stdout.txt 2> out/terminal_stderr.txt || cmd_exit=$?
+            if [ "${cmd_exit:-0}" = "124" ]; then
+              cmd_timed_out=true
+            fi
           fi
-          printf '{"exit_code":%s}\n' "${cmd_exit:-0}" > out/command.json
+          printf '{"exit_code":%s,"timed_out":%s}\n' "${cmd_exit:-0}" "${cmd_timed_out}" > out/command.json
           echo "step=terminal_done" >> out/step-marker.txt
 
       - name: Finalize output

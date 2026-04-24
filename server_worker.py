@@ -4,6 +4,7 @@ import base64
 import datetime as dt
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -27,6 +28,21 @@ LABEL_RETRY = "channel:retry"
 LABEL_DEAD = "channel:dead"
 LEASE_PREFIX = "channel:lease:"
 FAILURE_PREFIX = "channel:failures:"
+DEFAULT_TERMINAL_DENY_PATTERNS = (
+    r"(^|[;&|]\s*)rm\s+-rf\s+/",
+    r"(^|[;&|]\s*)sudo\s+rm\s+-rf\s+/",
+    r"(^|[;&|]\s*)mkfs(\.[a-z0-9]+)?\s",
+    r"(^|[;&|]\s*)fdisk\s",
+    r"(^|[;&|]\s*)parted\s",
+    r"(^|[;&|]\s*)shutdown\s",
+    r"(^|[;&|]\s*)reboot\s",
+    r"(^|[;&|]\s*)poweroff\s",
+    r"(^|[;&|]\s*)halt\s",
+    r"(^|[;&|]\s*)systemctl\s+stop\s+ssh",
+    r"(^|[;&|]\s*)systemctl\s+disable\s+ssh",
+    r"(^|[;&|]\s*)iptables\s",
+    r"(^|[;&|]\s*)ufw\s",
+)
 
 
 def _api_headers(token: str) -> Dict[str, str]:
@@ -80,13 +96,53 @@ def _delete_release_and_tag(base: str, token: str, run_id: str) -> None:
             raise
 
 
-def _prepare_local_egress_output(run_id: str, archive: bytes) -> tuple[str, str]:
+def _bool_env(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "no", ""}
+
+
+def _safe_slug(text: str, fallback: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "_", text.strip()).strip("._-")
+    return value[:80] or fallback
+
+
+def _terminal_deny_patterns() -> list[str]:
+    extra = [x.strip() for x in os.getenv("CHANNEL_EGRESS_TERMINAL_DENY_PATTERNS", "").splitlines() if x.strip()]
+    return list(DEFAULT_TERMINAL_DENY_PATTERNS) + extra
+
+
+def _validate_terminal_command(command: str) -> None:
+    if not command.strip():
+        return
+    if _bool_env("CHANNEL_EGRESS_ALLOW_UNSAFE_TERMINAL"):
+        return
+    for pattern in _terminal_deny_patterns():
+        if re.search(pattern, command, flags=re.IGNORECASE):
+            raise ValueError(f"terminal_cmd blocked by policy pattern: {pattern}")
+
+
+def _append_egress_index(root: Path, entry: Dict[str, Any]) -> str:
+    index_path = root / "index.jsonl"
+    with index_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return str(index_path)
+
+
+def _prepare_local_egress_output(
+    run_id: str,
+    request_id: str,
+    mode: str,
+    url: str,
+    archive: bytes,
+) -> tuple[str, str, str]:
     import io
     import tarfile
 
-    root = Path(os.getenv("CHANNEL_EGRESS_OUTPUT_DIR", os.getcwd())).resolve()
+    base_root = os.getenv("CHANNEL_EGRESS_OUTPUT_DIR", "").strip()
+    root = Path(base_root).resolve() if base_root else (Path(os.getcwd()).resolve() / "egress_archive")
     root.mkdir(parents=True, exist_ok=True)
-    out_dir = root / f"out_{run_id}"
+    date_dir = root / dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = date_dir / f"{_safe_slug(request_id, 'request')}_run_{run_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     archive_path = out_dir / "result.tgz"
@@ -98,18 +154,34 @@ def _prepare_local_egress_output(run_id: str, archive: bytes) -> tuple[str, str]
         top_levels = {
             Path(member.name).parts[0]
             for member in tf.getmembers()
-            if member.name and not member.name.startswith(("/", ".."))
+            if member.name and member.name not in {".", "./"} and not member.name.startswith(("/", ".."))
         }
+
+    index_path = _append_egress_index(
+        root,
+        {
+            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "request_id": request_id,
+            "run_id": run_id,
+            "mode": mode,
+            "url": url,
+            "local_output_dir": str(out_dir),
+            "local_archive_path": str(archive_path),
+        },
+    )
 
     if len(top_levels) == 1:
         extracted_root = out_dir / next(iter(top_levels))
         if extracted_root.is_dir():
-            return str(extracted_root), str(archive_path)
+            return str(extracted_root), str(archive_path), index_path
 
-    return str(out_dir), str(archive_path)
+    return str(out_dir), str(archive_path), index_path
 
 
 def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
+    terminal_cmd = str(args.get("terminal_cmd", ""))
+    _validate_terminal_command(terminal_cmd)
+
     token = os.getenv("GITHUB_TOKEN", "")
     owner = os.getenv("CHANNEL_OWNER", "")
     repo = os.getenv("CHANNEL_REPO", "")
@@ -127,7 +199,6 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
 
     body_text = str(args.get("body", ""))
     browser_script = str(args.get("browser_script", ""))
-    terminal_cmd = str(args.get("terminal_cmd", ""))
     browser_wait_ms = str(args.get("browser_wait_ms", "3000"))
     browser_headless = str(args.get("browser_headless", "true"))
 
@@ -199,7 +270,13 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError(f"invalid asset url for run-{run_id}")
 
     archive = _download_bytes(asset_url, token)
-    local_output_dir, local_archive_path = _prepare_local_egress_output(run_id, archive)
+    local_output_dir, local_archive_path, local_index_path = _prepare_local_egress_output(
+        run_id,
+        request_id,
+        mode,
+        url,
+        archive,
+    )
     if str(args.get("cleanup_release", os.getenv("CHANNEL_EGRESS_AUTO_CLEANUP", "true"))).strip().lower() not in {
         "0",
         "false",
@@ -277,6 +354,7 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
         "mode": mode,
         "local_output_dir": local_output_dir,
         "local_archive_path": local_archive_path,
+        "local_index_path": local_index_path,
         "status_code": status_code,
         "headers_preview": headers_preview,
         "body_preview": body_preview,

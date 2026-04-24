@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test worker-once worker-loop egress clean-egress
+.PHONY: test worker-once worker-loop egress clean-egress env-check recent-egress dev
 
 test:
 	$(PYTHON) -m unittest discover -s tests -v
@@ -16,3 +16,12 @@ egress:
 
 clean-egress:
 	bash ./scripts/clean-egress.sh
+
+env-check:
+	bash ./scripts/dev.sh env-check
+
+recent-egress:
+	bash ./scripts/dev.sh recent-egress
+
+dev:
+	bash ./scripts/dev.sh help

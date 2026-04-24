@@ -2,6 +2,7 @@
 import argparse
 import base64
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -42,6 +43,38 @@ DEFAULT_TERMINAL_DENY_PATTERNS = (
     r"(^|[;&|]\s*)systemctl\s+disable\s+ssh",
     r"(^|[;&|]\s*)iptables\s",
     r"(^|[;&|]\s*)ufw\s",
+)
+DEFAULT_TERMINAL_ALLOW_PATTERNS = (
+    r"^(sudo\s+)?apt(\s+update|\s+download|\s+cache|\s+policy|\s+show)(\s|$)",
+    r"^(sudo\s+)?apt-get(\s+update|\s+download)(\s|$)",
+    r"^npm\s+pack(\s|$)",
+    r"^npm\s+view(\s|$)",
+    r"^npx\s+playwright(\s|$)",
+    r"^curl(\s|$)",
+    r"^wget(\s|$)",
+    r"^mkdir(\s|$)",
+    r"^cd(\s|$)",
+    r"^pwd(\s|$)",
+    r"^ls(\s|$)",
+    r"^echo(\s|$)",
+    r"^printf(\s|$)",
+    r"^cat(\s|$)",
+    r"^head(\s|$)",
+    r"^tail(\s|$)",
+    r"^sed(\s|$)",
+    r"^awk(\s|$)",
+    r"^grep(\s|$)",
+    r"^rg(\s|$)",
+    r"^find(\s|$)",
+    r"^cp(\s|$)",
+    r"^mv(\s|$)",
+    r"^tar(\s|$)",
+    r"^unzip(\s|$)",
+    r"^zip(\s|$)",
+    r"^test(\s|$)",
+    r"^\[\[?.*\]?\]?$",
+    r"^true$",
+    r"^false$",
 )
 
 
@@ -110,20 +143,42 @@ def _terminal_deny_patterns() -> list[str]:
     return list(DEFAULT_TERMINAL_DENY_PATTERNS) + extra
 
 
+def _terminal_allow_patterns() -> list[str]:
+    extra = [x.strip() for x in os.getenv("CHANNEL_EGRESS_TERMINAL_ALLOW_PATTERNS", "").splitlines() if x.strip()]
+    return list(DEFAULT_TERMINAL_ALLOW_PATTERNS) + extra
+
+
+def _terminal_segments(command: str) -> list[str]:
+    segments = re.split(r"(?:&&|\|\||;|\n)+", command)
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
 def _validate_terminal_command(command: str) -> None:
     if not command.strip():
         return
     if _bool_env("CHANNEL_EGRESS_ALLOW_UNSAFE_TERMINAL"):
         return
+    if "$(" in command or "`" in command:
+        raise ValueError("terminal_cmd blocked by policy: command substitution is not allowed")
     for pattern in _terminal_deny_patterns():
         if re.search(pattern, command, flags=re.IGNORECASE):
             raise ValueError(f"terminal_cmd blocked by policy pattern: {pattern}")
+    allowed = _terminal_allow_patterns()
+    for segment in _terminal_segments(command):
+        normalized = re.sub(r"\s+", " ", segment).strip()
+        if any(re.match(pattern, normalized, flags=re.IGNORECASE) for pattern in allowed):
+            continue
+        raise ValueError(f"terminal_cmd blocked by allowlist policy: {normalized}")
 
 
 def _append_egress_index(root: Path, entry: Dict[str, Any]) -> str:
     index_path = root / "index.jsonl"
     with index_path.open("a", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     return str(index_path)
 
 

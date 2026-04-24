@@ -1,7 +1,7 @@
 const page = ctx.page;
 const wait = (ms) => page.waitForTimeout(ms);
 
-await page.goto("__START_URL__", { waitUntil: "domcontentloaded", timeout: 120000 });
+await page.goto(__START_URL_JSON__, { waitUntil: "domcontentloaded", timeout: 120000 });
 await wait(2500);
 
 await page.mouse.move(200, 200, { steps: 12 });
@@ -12,7 +12,7 @@ await wait(800);
 const input = page.locator('#kw, input[name="wd"], input[type="search"], textarea').first();
 await input.focus();
 await wait(500);
-await page.keyboard.type("__SEARCH_TERM__", { delay: 260 });
+await page.keyboard.type(__SEARCH_TERM_JSON__, { delay: 260 });
 await wait(1800);
 await page.keyboard.press("Enter");
 await page.waitForLoadState("domcontentloaded");

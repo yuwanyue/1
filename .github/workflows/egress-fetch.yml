@@ -67,6 +67,7 @@ jobs:
       TERMINAL_CMD_B64: ${{ inputs.terminal_cmd_b64 }}
       BROWSER_WAIT_MS: ${{ inputs.browser_wait_ms }}
       BROWSER_HEADLESS: ${{ inputs.browser_headless }}
+      PLAYWRIGHT_VERSION: 1.55.0
       npm_config_cache: ${{ github.workspace }}/npm-cache
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-cache
     steps:
@@ -88,14 +89,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/npm-cache
-          key: npm-cache-${{ runner.os }}-playwright-v1
+          key: npm-cache-${{ runner.os }}-playwright-${{ env.PLAYWRIGHT_VERSION }}
 
       - name: Cache Playwright browsers
         if: ${{ inputs.mode == 'screenshot' || inputs.mode == 'browser' }}
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/playwright-cache
-          key: playwright-cache-${{ runner.os }}-chromium-v1
+          key: playwright-cache-${{ runner.os }}-chromium-${{ env.PLAYWRIGHT_VERSION }}
 
       - name: Browser capture
         if: ${{ inputs.mode == 'screenshot' || inputs.mode == 'browser' }}
@@ -123,7 +124,7 @@ jobs:
           if [ ! -f package.json ]; then
             npm init -y >> out/error.txt 2>&1 || true
           fi
-          npm install playwright >> out/error.txt 2>&1 || true
+          npm install "playwright@${PLAYWRIGHT_VERSION}" >> out/error.txt 2>&1 || true
           npx playwright install chromium >> out/error.txt 2>&1 || true
           echo "step=browser_runtime_ready" >> out/step-marker.txt
 

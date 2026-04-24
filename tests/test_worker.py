@@ -342,6 +342,24 @@ class EgressFetchTests(unittest.TestCase):
                 }
             )
 
+    def test_run_github_egress_fetch_blocks_non_allowlisted_terminal_command(self):
+        with self.assertRaises(ValueError):
+            run_github_egress_fetch(
+                {
+                    "url": "https://example.com",
+                    "terminal_cmd": "python3 -c 'print(1)'",
+                }
+            )
+
+    def test_run_github_egress_fetch_blocks_command_substitution(self):
+        with self.assertRaises(ValueError):
+            run_github_egress_fetch(
+                {
+                    "url": "https://example.com",
+                    "terminal_cmd": "echo $(uname -a)",
+                }
+            )
+
 
 class ControllerTests(unittest.TestCase):
     def make_issue(self, issue_number, request_id, command="ping", args=None, state="open"):

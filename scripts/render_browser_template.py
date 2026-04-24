@@ -4,6 +4,14 @@ import json
 from pathlib import Path
 
 
+def render_browser_template(template_path: Path, start_url: str, search_term: str) -> str:
+    content = template_path.read_text(encoding="utf-8")
+    return (
+        content.replace("__START_URL_JSON__", json.dumps(start_url, ensure_ascii=False))
+        .replace("__SEARCH_TERM_JSON__", json.dumps(search_term, ensure_ascii=False))
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Render a reusable browser_script template.")
     parser.add_argument(
@@ -22,11 +30,7 @@ def main():
 
     root = Path.cwd()
     template_path = (root / args.template).resolve()
-    content = template_path.read_text(encoding="utf-8")
-    rendered = (
-        content.replace("__START_URL__", args.start_url.replace("\\", "\\\\").replace('"', '\\"'))
-        .replace("__SEARCH_TERM__", args.search_term.replace("\\", "\\\\").replace('"', '\\"'))
-    )
+    rendered = render_browser_template(template_path, args.start_url, args.search_term)
 
     if args.json:
         print(json.dumps(rendered, ensure_ascii=False))

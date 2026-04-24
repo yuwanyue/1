@@ -72,6 +72,8 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p out
+          : > out/error.txt
+          : > out/browser_console.log
           ts=$(date -u +%Y%m%dT%H%M%SZ)
 
           printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
@@ -86,9 +88,24 @@ jobs:
           fi
 
           if [ "$run_browser" -eq 1 ]; then
-            npm init -y >/dev/null 2>>out/error.txt || fetch_exit=$?
-            npm install playwright >/dev/null 2>>out/error.txt || fetch_exit=$?
-            npx playwright install --with-deps chromium >/dev/null 2>>out/error.txt || fetch_exit=$?
+            {
+              echo "== browser setup =="
+              echo "pwd=$(pwd)"
+              echo "node=$(command -v node || true)"
+              echo "npm=$(command -v npm || true)"
+              echo "npx=$(command -v npx || true)"
+              node -v || true
+              npm -v || true
+            } >> out/error.txt 2>&1
+
+            sudo apt-get update >>out/error.txt 2>&1 || fetch_exit=$?
+            sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fontconfig >>out/error.txt 2>&1 || fetch_exit=$?
+            fc-cache -fv >>out/error.txt 2>&1 || true
+            fc-match "Noto Sans CJK SC" >>out/error.txt 2>&1 || true
+
+            npm init -y >>out/error.txt 2>&1 || fetch_exit=$?
+            npm install playwright >>out/error.txt 2>&1 || fetch_exit=$?
+            npx playwright install chromium >>out/error.txt 2>&1 || fetch_exit=$?
 
             cat > out/capture.mjs <<'EOF'
             import fs from "node:fs";
@@ -110,8 +127,23 @@ jobs:
             let scriptResult = null;
             const consoleLogs = [];
 
+            fs.writeFileSync(`${outDir}/step-marker.txt`, "capture-script-started\n", "utf8");
+
             const browser = await chromium.launch({ headless });
-            const context = await browser.newContext({ viewport: { width: 1440, height: 1080 } });
+            const context = await browser.newContext({
+              viewport: { width: 1440, height: 1080 },
+              locale: "zh-CN",
+              timezoneId: "Asia/Shanghai",
+            });
+            await context.addInitScript(() => {
+              const style = document.createElement("style");
+              style.textContent = `
+                html, body, input, textarea, button, select {
+                  font-family: "Noto Sans CJK SC", "WenQuanYi Zen Hei", "Microsoft YaHei", "PingFang SC", "Heiti SC", sans-serif !important;
+                }
+              `;
+              document.documentElement.appendChild(style);
+            });
             const page = await context.newPage();
 
             page.on("console", (msg) => {
@@ -246,7 +278,7 @@ jobs:
           [ -f out/status_code.txt ] || echo "unknown" > out/status_code.txt
           [ -f out/headers.txt ] || : > out/headers.txt
           [ -f out/body.bin ] || : > out/body.bin
-          [ -f out/page.json ] || printf '{"title":"","final_url":"%s","error":""}\n' "$URL" > out/page.json
+          [ -f out/page.json ] || printf '{"title":"","final_url":"%s","error":"capture did not create page.json"}\n' "$URL" > out/page.json
           [ -f out/browser_console.log ] || : > out/browser_console.log
           [ -f out/terminal_stdout.txt ] || : > out/terminal_stdout.txt
           [ -f out/terminal_stderr.txt ] || : > out/terminal_stderr.txt

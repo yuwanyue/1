@@ -53,7 +53,7 @@ jobs:
           if [ "$MODE" = "screenshot" ]; then
             npm init -y >/dev/null 2>&1
             npm install playwright >/dev/null 2>&1
-            npx playwright install chromium --with-deps >/dev/null 2>&1
+            npx playwright install chromium >/dev/null 2>&1
             cat > out/capture.mjs <<'EOF'
             import fs from "node:fs";
             import { chromium } from "playwright";
@@ -64,20 +64,37 @@ jobs:
             const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
             let status = "unknown";
             let finalUrl = url;
+            let title = "";
+            let error = "";
             try {
-              const response = await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+              const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
+              await page.waitForTimeout(3000);
               if (response) {
                 status = String(response.status());
               }
               finalUrl = page.url();
-              await page.screenshot({ path: `${outDir}/screenshot.png`, fullPage: true });
-              const title = await page.title();
-              fs.writeFileSync(`${outDir}/page.json`, JSON.stringify({ title, final_url: finalUrl }));
+              title = await page.title();
+            } catch (err) {
+              error = err instanceof Error ? err.message : String(err);
             } finally {
+              try {
+                await page.screenshot({ path: `${outDir}/screenshot.png`, fullPage: true });
+              } catch (err) {
+                if (!error) {
+                  error = err instanceof Error ? err.message : String(err);
+                }
+              }
               await browser.close();
             }
+            fs.writeFileSync(
+              `${outDir}/page.json`,
+              JSON.stringify({ title, final_url: finalUrl, error }, null, 2),
+            );
             fs.writeFileSync(`${outDir}/status_code.txt`, `${status}\n`);
-            fs.writeFileSync(`${outDir}/headers.txt`, `mode=screenshot\nfinal_url=${finalUrl}\n`);
+            fs.writeFileSync(`${outDir}/headers.txt`, `mode=screenshot\nfinal_url=${finalUrl}\nerror=${error}\n`);
+            if (error) {
+              fs.writeFileSync(`${outDir}/error.txt`, `${error}\n`);
+            }
             EOF
             node out/capture.mjs
           else

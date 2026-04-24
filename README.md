@@ -127,6 +127,8 @@ worker 执行后，响应里会包含：
 - `headers_preview`
 - `body_preview`
 - `body_b64_head`（body 前 32KB 的 base64）
+- `local_output_dir`（本地解压目录）
+- `local_archive_path`（本地保存的归档路径）
 
 这样受限服务器无需直连目标站点，只需访问 GitHub API 与 Actions。
 
@@ -169,6 +171,12 @@ python3 controller_cli.py replay --issue 123 --request-id req_manual_replay_1
 python3 -m unittest discover -s tests -v
 ```
 
+也可以使用：
+
+```bash
+make test
+```
+
 ---
 
 ## 当前实现补充
@@ -182,6 +190,152 @@ python3 -m unittest discover -s tests -v
 - `controller_cli.py requeue` 可把死信或失败任务重新放回队列
 - `controller_cli.py replay` 可复制原命令为一条新任务，方便人工回放
 - worker 每轮输出一条 JSON，包含 `seen/processed/replayed/retried/dead_lettered/errors`
+- 仓库已通过 `.gitignore` 忽略 `out_*`、`__pycache__/` 等运行产物
+- 已提供 `make clean-egress` 和 `scripts/clean-egress.sh` 清理本地历史产物
+- egress 浏览器模式已增加 npm 与 Playwright 缓存，减少重复下载与安装
+
+---
+
+## 建议增强点
+
+结合当前代码与仓库现状，下一步最值得做的增强点有这些：
+
+### 1) 继续增强 egress 工作流缓存
+
+当前 `.github/workflows/egress-fetch.yml` 在浏览器模式下会重复执行：
+
+- `apt-get update`
+- 字体安装
+- `npm install playwright`
+- `npx playwright install chromium`
+
+建议：
+
+- 使用 `actions/cache` 缓存 `~/.npm`
+- 复用 Playwright 浏览器缓存目录
+- 将浏览器依赖拆成更稳定的预热步骤或独立工作流
+
+价值：
+
+- 明显缩短 `screenshot/browser` 模式耗时
+- 减少网络抖动导致的失败
+- 降低 GitHub Actions 分钟消耗
+
+### 2) 给远端 shell 命令增加安全边界
+
+现在 `terminal_cmd_b64` 可以直接执行任意 `bash -lc` 命令，实战上很好用，但生产环境建议再收口。
+
+建议：
+
+- 增加命令白名单或模式白名单
+- 对高风险命令做显式拦截，例如删除系统目录、改 SSH、改防火墙
+- 增加最大执行时长、最大输出体积、最大归档体积限制
+- 在响应里补充 `timed_out`、`truncated` 之类的状态字段
+
+价值：
+
+- 更适合团队共用
+- 降低误操作和仓库凭据被滥用的风险
+- 让失败原因更可观测
+
+### 3) 增强结果归档与保留策略
+
+当前已经实现了“先下载到本地，再自动清理 release/tag”，这是很实用的一步，但本地结果目录还可以进一步规范。
+
+建议：
+
+- 增加按日期或 request_id 的目录层级
+- 增加保留天数与自动清理策略
+- 给 `out_*` 增加索引文件，方便快速查找某次请求
+- 明确哪些文件是核心结果，哪些是调试附件
+
+价值：
+
+- 更适合长期运行
+- 本地结果更容易检索
+- 降低磁盘占用失控的概率
+
+### 4) 补一份“网络路由策略”说明
+
+现在仓库已经实际承担了“非 GitHub 外网访问统一经仓库中转”的角色，但 README 里还没有把这条策略单独讲清楚。
+
+建议：
+
+- 增加一节“网络访问约定”
+- 明确 GitHub 域名可直连，其他外网建议走 egress workflow
+- 给出 `curl`、`wget`、`apt`、`npm`、截图这几类常见示例
+
+价值：
+
+- 团队成员更容易理解什么时候该直连，什么时候该走中转
+- 能减少重复沟通和误用
+
+### 5) 增加更贴近真实场景的测试
+
+当前单元测试已经覆盖了协议解析、回放、死信、egress 基本流程，这很好。下一步更推荐补：
+
+- `cleanup_release=false` 的测试
+- 本地输出目录结构测试
+- release/tag 删除失败但主流程成功的测试
+- `terminal_cmd`、`browser_script`、大 body 返回的边界测试
+
+价值：
+
+- 让这套通道在持续演进时更稳
+- 降低“功能能跑但边界条件出错”的概率
+
+### 6) 增加更完整的运维入口
+
+建议补一个轻量入口，例如：
+
+- `Makefile`
+- `scripts/dev.sh`
+- `scripts/run_worker_once.sh`
+
+把这些常用动作封起来：
+
+- 跑测试
+- 单次 worker 处理
+- 发起 egress 请求
+- 清理本地产物
+- 查看最近一次 egress 结果
+- 一键检查必要环境变量
+
+价值：
+
+- 新接手的人更快上手
+- 日常排障命令更统一
+
+---
+
+## 运维入口
+
+仓库现在已经内置了一组轻量入口：
+
+```bash
+make test
+make worker-once
+make worker-loop
+make clean-egress
+```
+
+说明：
+
+- `make test`：跑单元测试
+- `make worker-once`：处理当前待执行命令一次
+- `make worker-loop`：持续轮询处理命令
+- `make clean-egress`：清理本地 `out_*` 结果目录和 Python 缓存
+
+建议：
+
+- 定期执行 `make clean-egress`
+- 仅在确实需要排障时保留 `out_*` 目录
+
+如需通过脚本直接清理，也可以执行：
+
+```bash
+bash ./scripts/clean-egress.sh
+```
 
 ---
 

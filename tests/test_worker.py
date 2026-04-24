@@ -2,6 +2,7 @@ import os
 import io
 import json
 import tarfile
+import tempfile
 import unittest
 from unittest import mock
 
@@ -252,27 +253,38 @@ class EgressFetchTests(unittest.TestCase):
 
         api_json.side_effect = fake_api
 
-        out = run_github_egress_fetch(
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
             {
-                "url": "https://example.com",
-                "method": "GET",
-                "mode": "browser",
-                "request_id": "req-1",
-                "browser_script": "await page.waitForTimeout(10); return {ok:true};",
-                "terminal_cmd": "echo ok",
-                "max_wait_seconds": 3,
-                "poll_interval_seconds": 1,
-            }
-        )
+                "CHANNEL_EGRESS_OUTPUT_DIR": tmpdir,
+            },
+            clear=False,
+        ):
+            out = run_github_egress_fetch(
+                {
+                    "url": "https://example.com",
+                    "method": "GET",
+                    "mode": "browser",
+                    "request_id": "req-1",
+                    "browser_script": "await page.waitForTimeout(10); return {ok:true};",
+                    "terminal_cmd": "echo ok",
+                    "max_wait_seconds": 3,
+                    "poll_interval_seconds": 1,
+                }
+            )
 
-        self.assertEqual(out["run_id"], "123")
-        self.assertEqual(out["mode"], "browser")
-        self.assertEqual(out["status_code"], "200")
-        self.assertEqual(out["page"]["title"], "Example")
-        self.assertEqual(out["command"]["exit_code"], 0)
-        self.assertIn("ok", out["terminal_stdout_preview"])
-        self.assertTrue(out["has_browser_artifacts"])
-        self.assertTrue(out["has_terminal_artifacts"])
+            self.assertEqual(out["run_id"], "123")
+            self.assertEqual(out["mode"], "browser")
+            self.assertEqual(out["status_code"], "200")
+            self.assertEqual(out["page"]["title"], "Example")
+            self.assertEqual(out["command"]["exit_code"], 0)
+            self.assertIn("ok", out["terminal_stdout_preview"])
+            self.assertTrue(out["has_browser_artifacts"])
+            self.assertTrue(out["has_terminal_artifacts"])
+            self.assertTrue(os.path.isdir(out["local_output_dir"]))
+            self.assertTrue(os.path.isfile(out["local_archive_path"]))
+            self.assertTrue(os.path.isfile(os.path.join(out["local_output_dir"], "status_code.txt")))
+            self.assertTrue(os.path.isfile(os.path.join(out["local_output_dir"], "page.json")))
 
 
 class ControllerTests(unittest.TestCase):

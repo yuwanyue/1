@@ -8,6 +8,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict
 from uuid import uuid4
 
@@ -77,6 +78,35 @@ def _delete_release_and_tag(base: str, token: str, run_id: str) -> None:
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
+
+
+def _prepare_local_egress_output(run_id: str, archive: bytes) -> tuple[str, str]:
+    import io
+    import tarfile
+
+    root = Path(os.getenv("CHANNEL_EGRESS_OUTPUT_DIR", os.getcwd())).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    out_dir = root / f"out_{run_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    archive_path = out_dir / "result.tgz"
+    archive_path.write_bytes(archive)
+
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+        tf.extractall(out_dir, filter="data")
+
+        top_levels = {
+            Path(member.name).parts[0]
+            for member in tf.getmembers()
+            if member.name and not member.name.startswith(("/", ".."))
+        }
+
+    if len(top_levels) == 1:
+        extracted_root = out_dir / next(iter(top_levels))
+        if extracted_root.is_dir():
+            return str(extracted_root), str(archive_path)
+
+    return str(out_dir), str(archive_path)
 
 
 def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -168,10 +198,8 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
     if not asset_url:
         raise RuntimeError(f"invalid asset url for run-{run_id}")
 
-    import io
-    import tarfile
-
     archive = _download_bytes(asset_url, token)
+    local_output_dir, local_archive_path = _prepare_local_egress_output(run_id, archive)
     if str(args.get("cleanup_release", os.getenv("CHANNEL_EGRESS_AUTO_CLEANUP", "true"))).strip().lower() not in {
         "0",
         "false",
@@ -190,7 +218,9 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
     terminal_stdout_preview = ""
     terminal_stderr_preview = ""
 
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+    import tarfile
+
+    with tarfile.open(Path(local_archive_path), mode="r:gz") as tf:
         members = {m.name: m for m in tf.getmembers()}
 
         def _member_by_suffix(name: str):
@@ -245,6 +275,8 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
         "url": url,
         "method": method,
         "mode": mode,
+        "local_output_dir": local_output_dir,
+        "local_archive_path": local_archive_path,
         "status_code": status_code,
         "headers_preview": headers_preview,
         "body_preview": body_preview,

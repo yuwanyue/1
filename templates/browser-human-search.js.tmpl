@@ -1,0 +1,32 @@
+const page = ctx.page;
+const wait = (ms) => page.waitForTimeout(ms);
+
+await page.goto("__START_URL__", { waitUntil: "domcontentloaded", timeout: 120000 });
+await wait(2500);
+
+await page.mouse.move(200, 200, { steps: 12 });
+await wait(1200);
+await page.mouse.move(420, 260, { steps: 18 });
+await wait(800);
+
+const input = page.locator('#kw, input[name="wd"], input[type="search"], textarea').first();
+await input.focus();
+await wait(500);
+await page.keyboard.type("__SEARCH_TERM__", { delay: 260 });
+await wait(1800);
+await page.keyboard.press("Enter");
+await page.waitForLoadState("domcontentloaded");
+await wait(6500);
+
+await page.mouse.wheel(0, 500);
+await wait(1200);
+
+return {
+  title: await page.title(),
+  finalUrl: page.url(),
+  bodyTextHead: await page
+    .locator("body")
+    .innerText()
+    .then((t) => t.slice(0, 500))
+    .catch(() => ""),
+};

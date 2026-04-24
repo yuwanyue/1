@@ -226,6 +226,59 @@ python3 controller_cli.py enqueue egress.fetch --args '{"url":"https://github.co
 
 ---
 
+## 真人化浏览器模板
+
+仓库现在内置了一份可复用的“更像真人的浏览器访问”模板，适合搜索页、输入框和简单交互场景。
+
+模板文件：
+
+- `templates/browser-human-search.js.tmpl`
+
+渲染工具：
+
+- `scripts/render_browser_template.py`
+
+快速生成脚本：
+
+```bash
+python3 ./scripts/render_browser_template.py \
+  --start-url "https://www.baidu.com" \
+  --search-term "周树人"
+```
+
+也可以使用 Make 入口：
+
+```bash
+make human-browser-template START_URL="https://www.baidu.com" SEARCH_TERM="周树人"
+```
+
+如果想把生成后的脚本直接嵌进 `egress.fetch` 的 `browser_script`，可先输出为 JSON 字符串：
+
+```bash
+python3 ./scripts/render_browser_template.py \
+  --start-url "https://www.baidu.com" \
+  --search-term "周树人" \
+  --json
+```
+
+模板默认包含这些“更像真人”的动作：
+
+- 打开页面后停顿
+- 鼠标移动
+- 聚焦输入框
+- 逐字输入关键词
+- 回车触发搜索
+- 等待结果页加载
+- 轻微滚动页面
+
+注意：
+
+- 这是通用模板，不保证所有站点都兼容
+- 百度、Google、部分电商和社交网站仍可能触发风控
+- 遇到复杂站点时，建议从这个模板出发，再按页面结构微调 selector 和等待时间
+
+---
+
 ## 建议增强点
 
 结合当前代码与仓库现状，下一步最值得做的增强点有这些：

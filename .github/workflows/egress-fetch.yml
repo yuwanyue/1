@@ -123,6 +123,7 @@ jobs:
           if [ "$fetch_exit" -ne 0 ]; then
             printf '\ncommand_exit=%s\n' "$fetch_exit" >> out/error.txt
           fi
+          true
       - name: Package result
         if: always()
         run: |

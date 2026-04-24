@@ -59,6 +59,7 @@ jobs:
     steps:
       - name: Execute egress action
         continue-on-error: true
+        shell: bash
         env:
           URL: ${{ inputs.url }}
           METHOD: ${{ inputs.method }}
@@ -70,10 +71,11 @@ jobs:
           BROWSER_WAIT_MS: ${{ inputs.browser_wait_ms }}
           BROWSER_HEADLESS: ${{ inputs.browser_headless }}
         run: |
-          set -uo pipefail
+          set -u -o pipefail
           mkdir -p out
           : > out/error.txt
           : > out/browser_console.log
+          trap 'rc=$?; echo "shell_err_line=$LINENO rc=$rc" >> out/error.txt' ERR
           ts=$(date -u +%Y%m%dT%H%M%SZ)
 
           printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
@@ -291,6 +293,7 @@ jobs:
 
       - name: Package result
         if: always()
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p out

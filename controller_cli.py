@@ -23,6 +23,10 @@ LEASE_PREFIX = "channel:lease:"
 FAILURE_PREFIX = "channel:failures:"
 
 
+def auto_cleanup_enabled() -> bool:
+    return os.getenv("CHANNEL_AUTO_CLEANUP", "true").strip().lower() not in {"0", "false", "no"}
+
+
 def make_client() -> GitHubQueueClient:
     token = os.getenv("GITHUB_TOKEN", "")
     owner = os.getenv("CHANNEL_OWNER", "")
@@ -133,6 +137,23 @@ def wait_response(client: GitHubQueueClient, issue_number: int, request_id: str,
     )
 
 
+def cleanup_request_records(client: GitHubQueueClient, issue_number: int, request_id: str):
+    errors = []
+    try:
+        client.delete_issue(issue_number)
+    except Exception as e:
+        errors.append(f"delete cmd issue #{issue_number} failed: {e}")
+
+    for issue in client.list_issues(state="all", labels=["channel:event", "channel:response"]):
+        if issue.title != f"[evt] response {request_id}":
+            continue
+        try:
+            client.delete_issue(issue.number)
+        except Exception as e:
+            errors.append(f"delete event issue #{issue.number} failed: {e}")
+    return errors
+
+
 def cmd_enqueue(args):
     client = make_client()
     obj = safe_json_arg(args.args)
@@ -143,6 +164,11 @@ def cmd_enqueue(args):
 def cmd_wait(args):
     client = make_client()
     resp = wait_response(client, args.issue, args.request_id, args.timeout, args.interval)
+    cleanup_errors = []
+    if auto_cleanup_enabled():
+        cleanup_errors = cleanup_request_records(client, args.issue, args.request_id)
+        for err in cleanup_errors:
+            print(f"warning: {err}", file=sys.stderr)
     print(json.dumps(resp, ensure_ascii=False))
 
 
@@ -151,6 +177,11 @@ def cmd_call(args):
     obj = safe_json_arg(args.args)
     rid, issue_no = enqueue(client, args.command, obj, args.request_id)
     resp = wait_response(client, issue_no, rid, args.timeout, args.interval)
+    cleanup_errors = []
+    if auto_cleanup_enabled():
+        cleanup_errors = cleanup_request_records(client, issue_no, rid)
+        for err in cleanup_errors:
+            print(f"warning: {err}", file=sys.stderr)
     print(json.dumps({"issue": issue_no, "response": resp}, ensure_ascii=False))
 
 

@@ -75,6 +75,7 @@ class FakeClient:
         result.extend(
             Issue(
                 number=999 + idx,
+                node_id=f"N_kwDO_test_{999 + idx}",
                 title=data["title"],
                 body=data["body"],
                 labels=data["labels"],
@@ -94,7 +95,14 @@ class FakeClient:
     def create_issue(self, title, body, labels):
         number = 100 + len(self.created_issues)
         self.created_issues.append({"title": title, "body": body, "labels": labels, "number": number})
-        self.issues[number] = Issue(number=number, title=title, body=body, labels=labels, state="open")
+        self.issues[number] = Issue(
+            number=number,
+            node_id=f"N_kwDO_test_{number}",
+            title=title,
+            body=body,
+            labels=labels,
+            state="open",
+        )
         return {"number": number, "title": title, "body": body, "labels": labels}
 
 
@@ -112,6 +120,7 @@ class WorkerTests(unittest.TestCase):
     def make_issue(self, body=None, labels=None):
         return Issue(
             number=1,
+            node_id="N_kwDO_test_1",
             title="[cmd] ping (req1)",
             body=body
             or json.dumps(
@@ -270,6 +279,7 @@ class ControllerTests(unittest.TestCase):
     def make_issue(self, issue_number, request_id, command="ping", args=None, state="open"):
         return Issue(
             number=issue_number,
+            node_id=f"N_kwDO_test_{issue_number}",
             title=f"[cmd] {command} ({request_id})",
             body=json.dumps(
                 {

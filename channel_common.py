@@ -23,6 +23,7 @@ class GitHubAPIError(RuntimeError):
 @dataclass
 class Issue:
     number: int
+    node_id: str
     title: str
     body: str
     labels: List[str]
@@ -35,6 +36,7 @@ class GitHubQueueClient:
         self.owner = owner
         self.repo = repo
         self.base = f"https://api.github.com/repos/{owner}/{repo}"
+        self.graphql = "https://api.github.com/graphql"
 
     def _req(
         self,
@@ -110,11 +112,39 @@ class GitHubQueueClient:
     def _issue_from_payload(data: Dict[str, Any]) -> Issue:
         return Issue(
             number=data["number"],
+            node_id=data.get("node_id", ""),
             title=data.get("title", ""),
             body=data.get("body", "") or "",
             labels=[x.get("name", "") for x in data.get("labels", [])],
             state=data.get("state", "open"),
         )
+
+    def _graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        raw = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "async-channel-template/1.0",
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(self.graphql, data=raw, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8")
+                payload = json.loads(body) if body else {}
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
+            detail = self._extract_error_message(body)
+            raise GitHubAPIError(
+                f"GitHub GraphQL request failed with HTTP {e.code}: {detail}",
+                status=e.code,
+                details=body,
+            )
+        except Exception as e:
+            raise GitHubAPIError(f"GitHub GraphQL request failed: {e}")
+        if payload.get("errors"):
+            raise GitHubAPIError(f"GitHub GraphQL request failed: {payload['errors']}")
+        return payload.get("data", {})
 
     def list_open_cmd_issues(self, per_page: int = 50) -> List[Issue]:
         # NOTE: GitHub issue search by labels can be eventually consistent right after
@@ -181,6 +211,22 @@ class GitHubQueueClient:
 
     def update_issue(self, issue_number: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._req("PATCH", f"/issues/{issue_number}", payload)
+
+    def delete_issue(self, issue_number: int) -> None:
+        issue = self.get_issue(issue_number)
+        if not issue.node_id:
+            raise GitHubAPIError(f"issue #{issue_number} has no node_id for deletion")
+        self._graphql(
+            "mutation($id:ID!){ deleteIssue(input:{issueId:$id}) { clientMutationId } }",
+            {"id": issue.node_id},
+        )
+
+    def delete_release(self, release_id: int) -> None:
+        self._req("DELETE", f"/releases/{release_id}")
+
+    def delete_tag_ref(self, tag_name: str) -> None:
+        encoded = urllib.parse.quote(tag_name, safe="")
+        self._req("DELETE", f"/git/refs/tags/{encoded}")
 
 
 def parse_cmd_issue_body(body: str) -> Dict[str, Any]:

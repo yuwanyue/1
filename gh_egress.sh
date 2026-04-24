@@ -92,6 +92,14 @@ OUT="out_$RUN_ID"
 mkdir -p "$OUT"
 curl -sS -L "$ASSET_URL" -o "$OUT/result.tgz"
 
+if [[ "${GH_EGRESS_AUTO_CLEANUP:-true}" != "false" && "${GH_EGRESS_AUTO_CLEANUP:-true}" != "0" ]]; then
+rel_id="$(printf '%s' "$rel_json" | jq -r '.id // ""')"
+if [[ -n "$rel_id" ]]; then
+  api DELETE "https://api.github.com/repos/$OWNER/$REPO/releases/$rel_id" >/dev/null || true
+fi
+api DELETE "https://api.github.com/repos/$OWNER/$REPO/git/refs/tags/$TAG" >/dev/null || true
+fi
+
 tar -xzf "$OUT/result.tgz" -C "$OUT"
 echo "[+] done: $OUT"
 echo "---- status_code ----"

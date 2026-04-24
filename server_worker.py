@@ -54,6 +54,31 @@ def _download_bytes(url: str, token: str) -> bytes:
         return resp.read()
 
 
+def _delete_release_and_tag(base: str, token: str, run_id: str) -> None:
+    release = _api_json("GET", f"{base}/releases/tags/run-{run_id}", token)
+    release_id = release.get("id")
+    if release_id:
+        req = urllib.request.Request(
+            f"{base}/releases/{release_id}",
+            method="DELETE",
+            headers=_api_headers(token),
+        )
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+
+    req = urllib.request.Request(
+        f"{base}/git/refs/tags/run-{run_id}",
+        method="DELETE",
+        headers=_api_headers(token),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+
+
 def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
     token = os.getenv("GITHUB_TOKEN", "")
     owner = os.getenv("CHANNEL_OWNER", "")
@@ -147,6 +172,15 @@ def run_github_egress_fetch(args: Dict[str, Any]) -> Dict[str, Any]:
     import tarfile
 
     archive = _download_bytes(asset_url, token)
+    if str(args.get("cleanup_release", os.getenv("CHANNEL_EGRESS_AUTO_CLEANUP", "true"))).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }:
+        try:
+            _delete_release_and_tag(base, token, run_id)
+        except Exception:
+            pass
     status_code = "unknown"
     headers_preview = ""
     body_preview = ""

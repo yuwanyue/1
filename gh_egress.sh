@@ -15,6 +15,7 @@ fi
 URL="$1"
 METHOD="${2:-GET}"
 BODY_TEXT="${3:-}"
+MODE="${4:-fetch}"
 REQUEST_ID="req-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 api() {
@@ -41,7 +42,7 @@ else
 BODY_B64=""
 fi
 
-payload="$(python3 - <<'PY' "$BRANCH" "$URL" "$METHOD" "$BODY_B64" "$REQUEST_ID"
+payload="$(python3 - <<'PY' "$BRANCH" "$URL" "$METHOD" "$BODY_B64" "$REQUEST_ID" "$MODE"
 import json,sys
 print(json.dumps({
 "ref": sys.argv[1],
@@ -49,7 +50,8 @@ print(json.dumps({
 "url": sys.argv[2],
 "method": sys.argv[3],
 "body_b64": sys.argv[4],
-"request_id": sys.argv[5]
+"request_id": sys.argv[5],
+"mode": sys.argv[6]
 }
 }))
 PY
@@ -122,8 +124,18 @@ cat "$OUT/status_code.txt" 2>/dev/null || true
 echo "---- headers (top 40) ----"
 sed -n '1,40p' "$OUT/headers.txt" 2>/dev/null || true
 echo "---- body preview ----"
+if [[ -f "$OUT/body.bin" ]]; then
 python3 - <<'PY' "$OUT/body.bin"
 import sys
 b=open(sys.argv[1],"rb").read(1000)
 print(b.decode("utf-8","replace"))
 PY
+fi
+if [[ -f "$OUT/page.json" ]]; then
+echo "---- page info ----"
+cat "$OUT/page.json"
+fi
+if [[ -f "$OUT/screenshot.png" ]]; then
+echo "---- screenshot ----"
+echo "$OUT/screenshot.png"
+fi

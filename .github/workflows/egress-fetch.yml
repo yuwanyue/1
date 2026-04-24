@@ -19,6 +19,11 @@ on:
         required: false
         default: ""
         type: string
+      mode:
+        description: fetch or screenshot
+        required: false
+        default: fetch
+        type: string
       request_id:
         description: caller-generated id for polling the correct run
         required: false
@@ -36,28 +41,61 @@ jobs:
           URL: ${{ inputs.url }}
           METHOD: ${{ inputs.method }}
           BODY_B64: ${{ inputs.body_b64 }}
+          MODE: ${{ inputs.mode }}
           REQUEST_ID: ${{ inputs.request_id }}
         run: |
           set -euo pipefail
           mkdir -p out
           ts=$(date -u +%Y%m%dT%H%M%SZ)
-          printf '{"url":"%s","method":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
-            "$URL" "$METHOD" "$ts" "${GITHUB_RUN_ID}" "$REQUEST_ID" > out/meta.json
+          printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
+            "$URL" "$METHOD" "$MODE" "$ts" "${GITHUB_RUN_ID}" "$REQUEST_ID" > out/meta.json
 
-          if [ -n "$BODY_B64" ]; then
-            echo "$BODY_B64" | base64 -d > out/req_body.bin || true
-            curl -sS -L -X "$METHOD" \
-              --connect-timeout 15 --max-time 120 \
-              --data-binary @out/req_body.bin \
-              -D out/headers.txt -o out/body.bin "$URL" || true
+          if [ "$MODE" = "screenshot" ]; then
+            npm init -y >/dev/null 2>&1
+            npm install playwright >/dev/null 2>&1
+            npx playwright install chromium --with-deps >/dev/null 2>&1
+            cat > out/capture.mjs <<'EOF'
+            import fs from "node:fs";
+            import { chromium } from "playwright";
+
+            const url = process.env.URL;
+            const outDir = "out";
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage({ viewport: { width: 1440, height: 1080 } });
+            let status = "unknown";
+            let finalUrl = url;
+            try {
+              const response = await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
+              if (response) {
+                status = String(response.status());
+              }
+              finalUrl = page.url();
+              await page.screenshot({ path: `${outDir}/screenshot.png`, fullPage: true });
+              const title = await page.title();
+              fs.writeFileSync(`${outDir}/page.json`, JSON.stringify({ title, final_url: finalUrl }));
+            } finally {
+              await browser.close();
+            }
+            fs.writeFileSync(`${outDir}/status_code.txt`, `${status}\n`);
+            fs.writeFileSync(`${outDir}/headers.txt`, `mode=screenshot\nfinal_url=${finalUrl}\n`);
+            EOF
+            node out/capture.mjs
           else
-            curl -sS -L -X "$METHOD" \
-              --connect-timeout 15 --max-time 120 \
-              -D out/headers.txt -o out/body.bin "$URL" || true
-          fi
+            if [ -n "$BODY_B64" ]; then
+              echo "$BODY_B64" | base64 -d > out/req_body.bin || true
+              curl -sS -L -X "$METHOD" \
+                --connect-timeout 15 --max-time 120 \
+                --data-binary @out/req_body.bin \
+                -D out/headers.txt -o out/body.bin "$URL" || true
+            else
+              curl -sS -L -X "$METHOD" \
+                --connect-timeout 15 --max-time 120 \
+                -D out/headers.txt -o out/body.bin "$URL" || true
+            fi
 
-          code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt)
-          echo "${code:-unknown}" > out/status_code.txt
+            code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt)
+            echo "${code:-unknown}" > out/status_code.txt
+          fi
 
           tar -czf result.tgz -C out .
 

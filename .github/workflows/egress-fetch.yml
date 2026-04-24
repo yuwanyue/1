@@ -115,7 +115,7 @@ jobs:
           } >> out/error.txt 2>&1
 
           sudo apt-get update >> out/error.txt 2>&1 || true
-          sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fontconfig >> out/error.txt 2>&1 || true
+          sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fontconfig xvfb >> out/error.txt 2>&1 || true
           fc-cache -fv >> out/error.txt 2>&1 || true
           fc-match "Noto Sans CJK SC" >> out/error.txt 2>&1 || true
           echo "step=browser_fonts_ready" >> out/step-marker.txt
@@ -268,7 +268,11 @@ jobs:
           marker("step=node_script_done");
           EOF
 
-          node out/capture.mjs >> out/error.txt 2>&1 || true
+          if [ "${BROWSER_HEADLESS:-true}" = "false" ]; then
+            xvfb-run -a node out/capture.mjs >> out/error.txt 2>&1 || true
+          else
+            node out/capture.mjs >> out/error.txt 2>&1 || true
+          fi
           echo "step=browser_step_done" >> out/step-marker.txt
 
       - name: HTTP fetch

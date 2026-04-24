@@ -138,6 +138,27 @@ jobs:
           const waitMs = Number.parseInt(process.env.BROWSER_WAIT_MS || "3000", 10);
           const browserScriptB64 = process.env.BROWSER_SCRIPT_B64 || "";
           const headless = (process.env.BROWSER_HEADLESS || "true").toLowerCase() !== "false";
+          const profiles = [
+            {
+              viewport: { width: 1366, height: 768 },
+              screen: { width: 1366, height: 768 },
+              userAgent:
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+              locale: "zh-CN",
+              timezoneId: "Asia/Shanghai",
+              platform: "Win32",
+            },
+            {
+              viewport: { width: 1440, height: 900 },
+              screen: { width: 1440, height: 900 },
+              userAgent:
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+              locale: "zh-CN",
+              timezoneId: "Asia/Shanghai",
+              platform: "MacIntel",
+            },
+          ];
+          const profile = profiles[Math.floor(Math.random() * profiles.length)];
 
           const consoleLogs = [];
           let status = "unknown";
@@ -149,14 +170,49 @@ jobs:
           let error = "";
 
           const marker = (name) => fs.appendFileSync(`${outDir}/step-marker.txt`, `${name}\n`, "utf8");
+          const humanPause = async (page, min = 200, max = 900) => {
+            const span = Math.max(0, max - min);
+            const delay = min + Math.floor(Math.random() * (span + 1));
+            await page.waitForTimeout(delay);
+          };
+          const humanWarmup = async (page) => {
+            const width = profile.viewport.width;
+            const height = profile.viewport.height;
+            await page.mouse.move(Math.floor(width * 0.18), Math.floor(height * 0.22), { steps: 12 });
+            await humanPause(page, 350, 900);
+            await page.mouse.move(Math.floor(width * 0.46), Math.floor(height * 0.34), { steps: 20 });
+            await humanPause(page, 250, 700);
+          };
+          const humanAfterLoad = async (page) => {
+            await humanPause(page, 700, 1600);
+            await page.mouse.wheel(0, 240 + Math.floor(Math.random() * 220));
+            await humanPause(page, 450, 1100);
+            await page.mouse.move(
+              Math.floor(profile.viewport.width * 0.62),
+              Math.floor(profile.viewport.height * 0.48),
+              { steps: 14 },
+            );
+            await humanPause(page, 300, 900);
+          };
           marker("step=node_script_start");
 
           try {
             const browser = await chromium.launch({ headless });
             const context = await browser.newContext({
-              viewport: { width: 1440, height: 1080 },
-              locale: "zh-CN",
-              timezoneId: "Asia/Shanghai",
+              viewport: profile.viewport,
+              screen: profile.screen,
+              userAgent: profile.userAgent,
+              locale: profile.locale,
+              timezoneId: profile.timezoneId,
+              colorScheme: "light",
+              reducedMotion: "no-preference",
+              deviceScaleFactor: 1,
+            });
+
+            await context.setExtraHTTPHeaders({
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Upgrade-Insecure-Requests": "1",
+              "Cache-Control": "max-age=0",
             });
 
             await context.addInitScript(() => {
@@ -168,6 +224,39 @@ jobs:
               `;
               document.documentElement.appendChild(style);
             });
+            await context.addInitScript(({ profile }) => {
+              Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+              Object.defineProperty(navigator, "platform", { get: () => profile.platform });
+              Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en-US", "en"] });
+              Object.defineProperty(navigator, "language", { get: () => "zh-CN" });
+              Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+              Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
+              Object.defineProperty(navigator, "plugins", {
+                get: () => [
+                  { name: "Chrome PDF Plugin" },
+                  { name: "Chrome PDF Viewer" },
+                  { name: "Native Client" },
+                ],
+              });
+              Object.defineProperty(window, "chrome", {
+                get: () => ({
+                  runtime: {},
+                  app: { isInstalled: false },
+                }),
+              });
+              Object.defineProperty(screen, "width", { get: () => profile.screen.width });
+              Object.defineProperty(screen, "height", { get: () => profile.screen.height });
+              Object.defineProperty(screen, "availWidth", { get: () => profile.screen.width });
+              Object.defineProperty(screen, "availHeight", { get: () => profile.screen.height - 40 });
+              const originalQuery = window.navigator.permissions?.query?.bind(window.navigator.permissions);
+              if (originalQuery) {
+                window.navigator.permissions.query = (parameters) => (
+                  parameters && parameters.name === "notifications"
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+                );
+              }
+            }, { profile });
 
             const page = await context.newPage();
             page.on("console", (msg) => {
@@ -182,8 +271,11 @@ jobs:
             marker("step=node_browser_launched");
 
             try {
+              await page.goto("about:blank", { waitUntil: "load", timeout: 30000 });
+              await humanWarmup(page);
               const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
               if (response) status = String(response.status());
+              await humanAfterLoad(page);
               if (Number.isFinite(waitMs) && waitMs > 0) {
                 await page.waitForTimeout(waitMs);
               }

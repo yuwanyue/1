@@ -64,19 +64,7 @@ echo "[+] dispatched request_id=$REQUEST_ID"
 RUN_ID=""
 for _ in $(seq 1 30); do
 runs_json="$(api GET "https://api.github.com/repos/$OWNER/$REPO/actions/workflows/$WF/runs?event=workflow_dispatch&per_page=20")"
-RUN_ID="$(python3 - <<'PY' "$runs_json" "$REQUEST_ID"
-import json,sys
-request_id = sys.argv[2]
-runs = json.loads(sys.argv[1]).get("workflow_runs", [])
-match = ""
-for run in runs:
-    title = run.get("display_title", "") or ""
-    if request_id in title:
-        match = str(run["id"])
-        break
-print(match)
-PY
-)"
+RUN_ID="$(printf '%s' "$runs_json" | jq -r --arg rid "$REQUEST_ID" '.workflow_runs[] | select((.display_title // "") | contains($rid)) | .id' | head -n1)"
 [[ -n "$RUN_ID" ]] && break
 sleep 2
 done
@@ -86,16 +74,8 @@ echo "[+] run_id=$RUN_ID"
 # 4) wait completion
 while true; do
 rjson="$(api GET "https://api.github.com/repos/$OWNER/$REPO/actions/runs/$RUN_ID")"
-status="$(python3 - <<'PY' "$rjson"
-import json,sys
-d=json.loads(sys.argv[1]); print(d.get("status",""))
-PY
-)"
-conclusion="$(python3 - <<'PY' "$rjson"
-import json,sys
-d=json.loads(sys.argv[1]); print(d.get("conclusion",""))
-PY
-)"
+status="$(printf '%s' "$rjson" | jq -r '.status // ""')"
+conclusion="$(printf '%s' "$rjson" | jq -r '.conclusion // ""')"
 echo " $status:$conclusion"
 [[ "$status" == "completed" ]] && break
 sleep 3
@@ -105,12 +85,7 @@ done
 # 5) download release asset by tag run-<run_id>
 TAG="run-$RUN_ID"
 rel_json="$(api GET "https://api.github.com/repos/$OWNER/$REPO/releases/tags/$TAG")"
-ASSET_URL="$(python3 - <<'PY' "$rel_json"
-import json,sys
-d=json.loads(sys.argv[1]); a=d.get("assets",[])
-print(a[0]["browser_download_url"] if a else "")
-PY
-)"
+ASSET_URL="$(printf '%s' "$rel_json" | jq -r '.assets[0].browser_download_url // ""')"
 [[ -n "$ASSET_URL" ]] || { echo "[-] no asset url"; exit 1; }
 
 OUT="out_$RUN_ID"

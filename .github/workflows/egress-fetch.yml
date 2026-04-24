@@ -44,16 +44,17 @@ jobs:
           MODE: ${{ inputs.mode }}
           REQUEST_ID: ${{ inputs.request_id }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p out
           ts=$(date -u +%Y%m%dT%H%M%SZ)
           printf '{"url":"%s","method":"%s","mode":"%s","time":"%s","run_id":"%s","request_id":"%s"}\n' \
             "$URL" "$METHOD" "$MODE" "$ts" "${GITHUB_RUN_ID}" "$REQUEST_ID" > out/meta.json
+          fetch_exit=0
 
           if [ "$MODE" = "screenshot" ]; then
-            npm init -y >/dev/null 2>&1
-            npm install playwright >/dev/null 2>&1
-            npx playwright install chromium >/dev/null 2>&1
+            npm init -y >/dev/null 2>>out/error.txt || fetch_exit=$?
+            npm install playwright >/dev/null 2>>out/error.txt || fetch_exit=$?
+            npx playwright install chromium >/dev/null 2>>out/error.txt || fetch_exit=$?
             cat > out/capture.mjs <<'EOF'
             import fs from "node:fs";
             import { chromium } from "playwright";
@@ -96,22 +97,30 @@ jobs:
               fs.writeFileSync(`${outDir}/error.txt`, `${error}\n`);
             }
             EOF
-            node out/capture.mjs
+            node out/capture.mjs >>out/error.txt 2>&1 || fetch_exit=$?
           else
             if [ -n "$BODY_B64" ]; then
               echo "$BODY_B64" | base64 -d > out/req_body.bin || true
               curl -sS -L -X "$METHOD" \
                 --connect-timeout 15 --max-time 120 \
                 --data-binary @out/req_body.bin \
-                -D out/headers.txt -o out/body.bin "$URL" || true
+                -D out/headers.txt -o out/body.bin "$URL" >>out/error.txt 2>&1 || fetch_exit=$?
             else
               curl -sS -L -X "$METHOD" \
                 --connect-timeout 15 --max-time 120 \
-                -D out/headers.txt -o out/body.bin "$URL" || true
+                -D out/headers.txt -o out/body.bin "$URL" >>out/error.txt 2>&1 || fetch_exit=$?
             fi
 
-            code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt)
+            code=$(awk 'BEGIN{c=""} /^HTTP/{c=$2} END{print c}' out/headers.txt 2>/dev/null || true)
             echo "${code:-unknown}" > out/status_code.txt
+          fi
+
+          [ -f out/status_code.txt ] || echo "unknown" > out/status_code.txt
+          [ -f out/headers.txt ] || : > out/headers.txt
+          [ -f out/body.bin ] || : > out/body.bin
+          [ -f out/page.json ] || printf '{"title":"","final_url":"%s","error":""}\n' "$URL" > out/page.json
+          if [ "$fetch_exit" -ne 0 ]; then
+            printf '\ncommand_exit=%s\n' "$fetch_exit" >> out/error.txt
           fi
 
           tar -czf result.tgz -C out .
